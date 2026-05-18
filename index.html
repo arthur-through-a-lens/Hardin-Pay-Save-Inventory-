@@ -1571,8 +1571,8 @@ try { console.info(`[pay-and-save] file ${APP_VERSION} loaded`); } catch(e) {}
 // NEVER put a SECRET key (sb_secret_...) here — that key has elevated
 // access and must stay server-side only.
 // ════════════════════════════════════════════════════════════════════
-const CLOUD_DEFAULT_URL = '';   // e.g. 'https://fzoecqtmftaasioeezeu.supabase.co'
-const CLOUD_DEFAULT_KEY = '';   // e.g. 'sb_publishable_xxx_yyy'
+const CLOUD_DEFAULT_URL = 'https://fzoecqtmftaasioeezeu.supabase.co';   // e.g. 'https://fzoecqtmftaasioeezeu.supabase.co'
+const CLOUD_DEFAULT_KEY = 'sb_publishable_BcYI0oYWfdDghlLqK4DCEw_Jj-vNIAI';   // e.g. 'sb_publishable_xxx_yyy'
 if (typeof window.storage === 'undefined') {
   window.storage = {
     async get(key, shared) {
