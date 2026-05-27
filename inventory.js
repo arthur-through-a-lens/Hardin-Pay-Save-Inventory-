@@ -1,0 +1,9806 @@
+/* =========================================================================
+   PAY & SAVE — INTEGRATED WAREHOUSE OPERATIONS PLATFORM
+   Combines inventory, master records, lookups, customers, users, and audit.
+   ========================================================================= */
+
+/* ---------- STORAGE POLYFILL ----------
+   window.storage is the Claude artifact persistence API. When the file
+   runs INSIDE the Claude environment, the runtime injects it. When the
+   file runs OUTSIDE Claude (downloaded HTML, static hosting, file://,
+   etc.) window.storage is undefined and every save call would throw
+   "Cannot read properties of undefined (reading 'set')".
+
+   This polyfill matches the documented window.storage API surface and
+   backs it with localStorage. The SHARED flag is a no-op — localStorage
+   is always per-origin per-browser-profile, so multi-user sharing is
+   not possible standalone. For single-user / single-machine use it
+   works fine and survives reloads.
+
+   The polyfill ONLY installs if window.storage isn't already defined,
+   so inside Claude this code is inert. */
+
+const APP_VERSION = 'v45';
+// One-time load banner so users can verify which build their browser
+// is actually running (a recurring source of confusion when the page
+// is being cached by GitHub Pages, Cloudflare, etc.).
+try { console.info(`[pay-and-save] file ${APP_VERSION} loaded`); } catch(e) {}
+
+// ════════════════════════════════════════════════════════════════════
+// CLOUD SYNC AUTO-CONFIG  ← fill these in to share data across devices
+// ════════════════════════════════════════════════════════════════════
+// If you fill in these two constants, every device that loads this HTML
+// will automatically connect to your Supabase project on first visit —
+// no per-device setup screen, no manually pasting the URL + key into
+// every browser. New devices auto-pull your existing data and go
+// straight to the sign-in page with your existing users.
+//
+// Leave both empty to keep the original behavior (every device must
+// manually configure Cloud Sync from the Settings menu).
+//
+// SECURITY NOTE: the PUBLISHABLE key (sb_publishable_...) is DESIGNED
+// to be embedded in client-side code per Supabase docs. It's safe to
+// commit to a public GitHub repo — RLS policies on the pns_kv table
+// (set by the SQL setup script) are what actually protect your data.
+// NEVER put a SECRET key (sb_secret_...) here — that key has elevated
+// access and must stay server-side only.
+// ════════════════════════════════════════════════════════════════════
+const CLOUD_DEFAULT_URL = 'https://fzoecqtmftaasioeezeu.supabase.co';   // e.g. 'https://fzoecqtmftaasioeezeu.supabase.co'
+const CLOUD_DEFAULT_KEY = 'sb_publishable_BcYI0oYWfdDghlLqK4DCEw_Jj-vNIAI';   // e.g. 'sb_publishable_xxx_yyy'
+if (typeof window.storage === 'undefined') {
+  window.storage = {
+    async get(key, shared) {
+      try {
+        const value = localStorage.getItem(key);
+        return value == null ? null : { key, value, shared: !!shared };
+      } catch (e) { return null; }
+    },
+    async set(key, value, shared) {
+      // localStorage throws QuotaExceededError when full; let the caller
+      // see it through the same try/catch path the real API uses.
+      localStorage.setItem(key, value);
+      return { key, value, shared: !!shared };
+    },
+    async delete(key, shared) {
+      try {
+        const had = localStorage.getItem(key) != null;
+        localStorage.removeItem(key);
+        return { key, deleted: had, shared: !!shared };
+      } catch (e) { return null; }
+    },
+    async list(prefix, shared) {
+      try {
+        const keys = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k != null && (!prefix || k.startsWith(prefix))) keys.push(k);
+        }
+        return { keys, prefix, shared: !!shared };
+      } catch (e) { return null; }
+    }
+  };
+  // Optional one-line console hint so future maintainers know which
+  // backend is active. No user-visible UI change.
+  try { console.info('[pay-and-save] window.storage polyfill active (localStorage backend) — multi-user SHARED flag is a no-op.'); } catch(e) {}
+}
+
+const SHARED = true;
+
+/* ---------- CLOUD SYNC (Supabase) ----------
+   Optional layer on top of window.storage that mirrors writes to a
+   Supabase PostgreSQL table and pulls updates from other devices in
+   real-time. When NOT configured, the app behaves exactly as it did
+   before (local-only). When configured + enabled, writes go to BOTH
+   local storage (instant, offline-tolerant) AND cloud (eventual).
+   Reads prefer cloud when connected, fall back to local.
+
+   Schema (the user runs this SQL once in their Supabase project's
+   SQL Editor — surfaced verbatim in the Cloud Sync settings panel):
+
+     create table pns_kv (
+       key text primary key,
+       value text not null,
+       updated_at timestamptz not null default now()
+     );
+     alter table pns_kv enable row level security;
+     create policy "anon all" on pns_kv for all to anon
+       using (true) with check (true);
+     alter publication supabase_realtime add table pns_kv;
+
+   Why a single KV table instead of per-entity tables: the app already
+   key-value-stores everything locally. Mirroring that to one Postgres
+   row per key keeps the change surface small and means future entity
+   schemas don't trigger DB migrations. */
+const CLOUD = {
+  url: null,           // Supabase project URL (e.g. https://xxx.supabase.co)
+  anonKey: null,       // Supabase anon (public) key
+  enabled: false,      // user-toggled — true means "use cloud when possible"
+  connected: false,    // runtime — true means SDK loaded + channel subscribed
+  client: null,        // Supabase JS client instance (lazy-loaded)
+  channel: null,       // realtime channel subscription
+  lastError: null,     // last sync error (surfaced in status pill tooltip)
+  lastSyncAt: null,    // timestamp of last successful cloud round-trip
+  status: 'idle'       // 'idle' | 'connecting' | 'syncing' | 'connected' | 'error'
+};
+
+const CLOUD_CONFIG_KEY = 'pns:cloudConfig';      // stored in localStorage only — chicken-and-egg with itself
+const SESSION_KEY      = 'pns:session';          // stored in localStorage only — per-device sign-in persistence, deliberately NOT mirrored to cloud
+const SUPABASE_SDK_URL = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
+
+/* Save / load cloud config to localStorage directly (NOT through the
+   wrapped window.storage — we need to read this BEFORE deciding whether
+   to wire up cloud). */
+function loadCloudConfigSync() {
+  try {
+    const raw = localStorage.getItem(CLOUD_CONFIG_KEY);
+    if (raw) {
+      const cfg = JSON.parse(raw);
+      if (cfg && typeof cfg === 'object' && cfg.url && cfg.anonKey) {
+        CLOUD.url = cfg.url;
+        CLOUD.anonKey = cfg.anonKey;
+        CLOUD.enabled = !!cfg.enabled;
+        return;
+      }
+    }
+  } catch (e) {}
+  // Per-device config wasn't found in localStorage. Fall back to the
+  // file-level defaults (CLOUD_DEFAULT_URL + CLOUD_DEFAULT_KEY) if the
+  // HTML has them filled in. This is the new-device auto-connect path:
+  // a fresh browser with no localStorage still gets cloud sync from the
+  // baked-in defaults, so it can pull existing data and skip the
+  // bootstrap-first-user screen.
+  if (CLOUD_DEFAULT_URL && CLOUD_DEFAULT_KEY) {
+    CLOUD.url = String(CLOUD_DEFAULT_URL).trim().replace(/\/rest\/v1\/?$/i, '').replace(/\/+$/, '');
+    CLOUD.anonKey = String(CLOUD_DEFAULT_KEY).trim();
+    CLOUD.enabled = true;
+  }
+}
+function saveCloudConfigSync() {
+  try {
+    localStorage.setItem(CLOUD_CONFIG_KEY, JSON.stringify({
+      url: CLOUD.url, anonKey: CLOUD.anonKey, enabled: CLOUD.enabled
+    }));
+  } catch (e) {}
+}
+
+/* Normalize a Supabase project URL. Users often copy the REST API URL
+   (which ends in /rest/v1/) instead of the bare project URL — both are
+   shown on the Project Settings → API page in the dashboard, easy to
+   mix up. We strip the path so testCloudConnection / connectCloud /
+   pushLocalToCloud all see the same canonical form regardless of which
+   URL the user pasted. */
+function normalizeSupabaseUrl(url) {
+  if (!url) return '';
+  let u = String(url).trim();
+  // Strip query/fragment first (paranoia — users sometimes paste with these)
+  u = u.replace(/[?#].*$/, '');
+  // Strip a trailing /rest/v1, /rest/v1/, or /rest/v1/<anything>
+  u = u.replace(/\/rest\/v1(\/.*)?$/i, '');
+  // Strip remaining trailing slashes
+  u = u.replace(/\/+$/, '');
+  return u;
+}
+
+/* Decode a JWT's payload without verifying the signature. We only use this
+   to surface obvious copy-paste mistakes (wrong project, wrong role) BEFORE
+   a network call — never for any auth decision. Returns null if the input
+   isn't a parseable JWT. */
+function decodeJwtPayload(token) {
+  try {
+    const parts = String(token).split('.');
+    if (parts.length !== 3) return null;
+    // base64url → base64 (replace URL-safe chars) → bytes → text → JSON
+    let b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (b64.length % 4) b64 += '=';
+    return JSON.parse(atob(b64));
+  } catch (e) { return null; }
+}
+
+/* Pull the project ref (the subdomain piece — e.g. "cgwbrznjmympxtohinzm"
+   for cgwbrznjmympxtohinzm.supabase.co) out of a URL. Used to compare
+   against the JWT's embedded ref. */
+function extractProjectRef(url) {
+  if (!url) return null;
+  const m = String(url).match(/^https?:\/\/([a-z0-9]+)\.supabase\./i);
+  return m ? m[1] : null;
+}
+
+/* Test a connection against a Supabase project + table. Two-step probe so
+   we can distinguish:
+     · Project URL is wrong / unreachable        → step 1 fails
+     · URL is right but anon key is wrong         → step 1 returns 401/403
+     · URL + key are valid, table is missing      → step 1 ok, step 2 returns 404
+     · Everything is set up correctly             → both steps ok
+   Each branch returns a specific actionable error message so the user
+   doesn't have to guess which of three problems they're hitting. */
+async function testCloudConnection(url, anonKey) {
+  if (!url || !anonKey) return { ok: false, error: 'URL and anon key are both required' };
+  if (!/^https?:\/\//.test(url)) return { ok: false, error: 'URL must start with https://' };
+  const cleanUrl = normalizeSupabaseUrl(url);
+  const trimmedKey = String(anonKey).trim();
+  const headers = { apikey: trimmedKey, Authorization: `Bearer ${trimmedKey}` };
+  const urlRef = extractProjectRef(cleanUrl);
+
+  // Up-front key inspection. Supabase has TWO key formats since their
+  // November 2025 migration:
+  //   · legacy JWT (eyJ...)              — anon/service_role, default for pre-Nov-2025 projects
+  //   · new publishable (sb_publishable_...) — required by new projects (post-Nov-2025)
+  // Plus the always-wrong secrets: service_role JWT, sb_secret_...
+  // Detect which we have and run format-specific pre-checks BEFORE any
+  // network call so error messages can name the specific mistake.
+  let keyKind = 'unknown';
+  let keyRef = null;
+  let keyRole = null;
+  let jwtPayload = null;
+
+  if (trimmedKey.startsWith('sb_secret_')) {
+    return { ok: false, error: 'You pasted a SECRET key (sb_secret_...). That has admin access and must NEVER be in client-side code. Use the publishable key (sb_publishable_...) instead — same API Keys page in Supabase.' };
+  } else if (trimmedKey.startsWith('sb_publishable_')) {
+    keyKind = 'publishable';
+    keyRole = 'publishable';
+    // Publishable keys are opaque random strings — no embedded project ref to
+    // cross-check against the URL. The server validates membership at request time.
+  } else if (trimmedKey.startsWith('eyJ')) {
+    jwtPayload = decodeJwtPayload(trimmedKey);
+    if (!jwtPayload) {
+      return { ok: false, error: 'The key starts with "eyJ" (looks like a JWT) but failed to parse. Re-copy it from Project Settings → API using the Copy button — manual selection sometimes truncates these long strings.' };
+    }
+    keyKind = 'jwt';
+    keyRef = jwtPayload.ref;
+    keyRole = jwtPayload.role;
+    if (keyRole === 'service_role') {
+      return { ok: false, error: 'You pasted the SERVICE_ROLE key — that has admin access and must NEVER be in client-side code. Use the anon (or publishable) key on the same page.' };
+    }
+    if (keyRole && keyRole !== 'anon') {
+      return { ok: false, error: `The pasted key has role "${keyRole}". The app needs the anon key (or a publishable key).` };
+    }
+    if (urlRef && keyRef && urlRef !== keyRef) {
+      return { ok: false, error: `The URL is for project "${urlRef}" but the anon key belongs to project "${keyRef}". They're from different projects — use the project switcher (top-left of the dashboard) and re-copy both fields from the SAME project's Settings → API.` };
+    }
+  } else {
+    return { ok: false, error: 'The key doesn\'t look like any known Supabase API key format. It should be either a publishable key (starts with "sb_publishable_") for new projects, or a legacy anon JWT (starts with "eyJ"). Re-copy from Project Settings → API.' };
+  }
+
+  // Diagnostic log: prints non-secret key claims so the user can paste console
+  // output for debugging without leaking the key bytes.
+  try {
+    console.info(`[pay-and-save] test connection · ${APP_VERSION}`, {
+      normalizedUrl: cleanUrl,
+      urlRef,
+      keyKind,
+      keyRole,
+      keyRef,
+      // Backward-compat fields so older debugging instructions still work
+      jwtParsed: keyKind === 'jwt',
+      jwtRef: keyRef,
+      jwtRole: keyRole,
+      jwtIss: jwtPayload && jwtPayload.iss,
+      jwtExp: jwtPayload && jwtPayload.exp ? new Date(jwtPayload.exp * 1000).toISOString() : null
+    });
+  } catch(e) {}
+
+  // Single probe: query pns_kv directly. We used to do a two-step probe
+  // (hit /rest/v1/ first to validate URL+key, then query the table), but
+  // Supabase's 2025 security update restricted the OpenAPI spec at /rest/v1/
+  // to require elevated permissions when using publishable keys — so that
+  // pre-flight ALWAYS returned 401 ("Secret API key required") for publishable
+  // keys even when the actual key was valid. The table query exercises
+  // every layer we care about (URL reachable, key valid, table exists,
+  // RLS allows anon read) in one shot, so we just go straight to it.
+  try {
+    const r = await fetch(`${cleanUrl}/rest/v1/pns_kv?select=key&limit=1`, { headers });
+    if (r.ok) return { ok: true };
+
+    // Try to extract a specific error message from the response body for
+    // every failure case.
+    let serverDetail = '';
+    try {
+      const body = await r.clone().text();
+      const j = body && body.trim().startsWith('{') ? JSON.parse(body) : null;
+      const msg = (j && (j.message || j.msg || j.hint)) || (body || '').trim();
+      if (msg) serverDetail = ` Server said: "${msg.slice(0, 200)}".`;
+    } catch (e) {}
+
+    if (r.status === 401 || r.status === 403) {
+      // Format-specific suggestions for the most common 401/403 causes.
+      if (keyKind === 'jwt') {
+        return { ok: false, error: `Auth rejected (HTTP ${r.status}).${serverDetail} Your project may have legacy JWT keys disabled (default for projects created after Nov 2025). Try the PUBLISHABLE key (sb_publishable_...) from Project Settings → API instead.` };
+      }
+      return { ok: false, error: `Auth rejected (HTTP ${r.status}).${serverDetail} Re-copy both URL and publishable key from Project Settings → API and confirm they're from the same project.` };
+    }
+    if (r.status === 404) {
+      return { ok: false, error:
+        `URL + key reached Supabase, but PostgREST cannot see table "pns_kv".${serverDetail} Three likely fixes (in order):\n` +
+        '  (1) Open Supabase Table Editor. If pns_kv is NOT listed there, re-run the SQL — watch for red error text in the results panel.\n' +
+        '  (2) If it IS listed, run this in the SQL Editor: NOTIFY pgrst, \'reload schema\';\n' +
+        '  (3) Confirm the URL and key are both from the SAME project.'
+      };
+    }
+    return { ok: false, error: `Unexpected response from pns_kv: HTTP ${r.status}.${serverDetail}` };
+  } catch (e) {
+    return { ok: false, error: 'Network error reaching Supabase: ' + e.message };
+  }
+}
+
+/* Lazy-load the Supabase JS SDK from CDN. Resolves with window.supabase. */
+function loadSupabaseSDK() {
+  if (window.supabase) return Promise.resolve(window.supabase);
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector('script[data-supabase-sdk]');
+    if (existing) { existing.addEventListener('load', () => resolve(window.supabase)); return; }
+    const s = document.createElement('script');
+    s.src = SUPABASE_SDK_URL;
+    s.dataset.supabaseSdk = '1';
+    s.onload = () => resolve(window.supabase);
+    s.onerror = () => reject(new Error('Failed to load Supabase SDK from CDN — check your network'));
+    document.head.appendChild(s);
+  });
+}
+
+/* Connect to cloud — loads SDK, initializes client, subscribes to realtime
+   changes on pns_kv. Idempotent; safe to call multiple times.
+
+   v64: the .subscribe() call now passes a status callback so we can react
+   to the channel going CHANNEL_ERROR / TIMED_OUT / CLOSED (events that
+   silently broke realtime in earlier versions and required a manual page
+   refresh). On successful SUBSCRIBED, we also pullFreshFromCloud once
+   to catch up on anything that changed while we were offline. */
+async function connectCloud() {
+  if (!CLOUD.url || !CLOUD.anonKey) throw new Error('Cloud not configured');
+  CLOUD.status = 'connecting';
+  refreshCloudStatusPill();
+  try {
+    const sb = await loadSupabaseSDK();
+    if (!sb || !sb.createClient) throw new Error('Supabase SDK loaded but createClient missing');
+    CLOUD.client = sb.createClient(CLOUD.url, CLOUD.anonKey, {
+      auth: { persistSession: false }    // we're not using Supabase Auth — anon key only
+    });
+    // Subscribe to realtime changes on pns_kv. When a row changes (from
+    // another device), pull the new value into local cache + state, then
+    // re-render. The .on(...) registration before .subscribe() is required
+    // by the SDK.
+    if (CLOUD.channel) try { await CLOUD.channel.unsubscribe(); } catch(e){}
+    CLOUD.channel = CLOUD.client
+      .channel('pns_kv_changes')
+      .on('postgres_changes',
+          { event: '*', schema: 'public', table: 'pns_kv' },
+          (payload) => handleCloudRealtime(payload))
+      .subscribe((status, err) => {
+        // v64: status callback. The SDK calls us with one of:
+        //   SUBSCRIBED      → channel is live; clear backoff + pull fresh
+        //   CHANNEL_ERROR   → server-side problem; schedule reconnect
+        //   TIMED_OUT       → no response from server; schedule reconnect
+        //   CLOSED          → channel closed; schedule reconnect
+        if (status === 'SUBSCRIBED') {
+          CLOUD.connected = true;
+          CLOUD.status = 'connected';
+          CLOUD.lastError = null;
+          _cloudReconnectAttempts = 0;
+          if (_cloudReconnectTimer) { clearTimeout(_cloudReconnectTimer); _cloudReconnectTimer = null; }
+          refreshCloudStatusPill();
+          // Pull anything we may have missed during the gap. Fire and forget —
+          // failures here aren't fatal, the next realtime event will trigger
+          // another update.
+          pullFreshFromCloud().catch(() => {});
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+          CLOUD.connected = false;
+          CLOUD.status = 'error';
+          CLOUD.lastError = err ? (err.message || String(err)) : ('Realtime ' + status);
+          refreshCloudStatusPill();
+          scheduleCloudReconnect();
+        }
+      });
+    // Mark as "connected" provisionally — the status callback above will
+    // confirm or downgrade once the SDK reports. For backward compat with
+    // existing code reading CLOUD.connected right after connectCloud, also
+    // set it here.
+    CLOUD.connected = true;
+    CLOUD.status = 'connected';
+    CLOUD.lastError = null;
+    refreshCloudStatusPill();
+  } catch (e) {
+    CLOUD.connected = false;
+    CLOUD.status = 'error';
+    CLOUD.lastError = e.message;
+    refreshCloudStatusPill();
+    // v64: also schedule a reconnect after a connectCloud() failure so a
+    // bad initial network state doesn't strand the user permanently.
+    scheduleCloudReconnect();
+    throw e;
+  }
+}
+
+/* v64: reconnect machinery. Exponential backoff capped at 30s. Single-
+   flight via _cloudReconnectTimer so a flood of CHANNEL_ERROR events
+   doesn't queue dozens of concurrent reconnect attempts. */
+let _cloudReconnectTimer = null;
+let _cloudReconnectAttempts = 0;
+function scheduleCloudReconnect() {
+  if (_cloudReconnectTimer) return;                             // already scheduled
+  if (!CLOUD.url || !CLOUD.anonKey) return;                     // cloud not configured
+  if (!CLOUD.enabled) return;                                   // explicitly disabled
+  _cloudReconnectAttempts++;
+  // 1s, 2s, 4s, 8s, 16s, 30s, 30s, …
+  const delayMs = Math.min(30_000, 1_000 * Math.pow(2, _cloudReconnectAttempts - 1));
+  _cloudReconnectTimer = setTimeout(async () => {
+    _cloudReconnectTimer = null;
+    try { await connectCloud(); }
+    catch(e) { /* scheduleCloudReconnect in catch above handles re-queueing */ }
+  }, delayMs);
+}
+
+/* v64: after a successful (re)subscribe — and on tab-focus — pull every
+   key from cloud into local cache, then reload state from cache. This
+   covers two real-world cases:
+     · WebSocket was throttled while the tab slept → we missed events
+     · Initial connect on a stale page → catch up before render
+   Falls through silently if cloud isn't available. */
+async function pullFreshFromCloud() {
+  if (!CLOUD.client || !CLOUD.connected) return;
+  try {
+    await pullCloudToLocal();
+    for (const key of Object.values(KEYS)) {
+      try { await reloadStateKey(key); } catch(e) {}
+    }
+    if (typeof render === 'function') render();
+  } catch (e) { /* non-fatal — next realtime event will catch us up */ }
+}
+
+/* v64: when the tab regains focus or the OS reports network restoration,
+   verify the cloud is still working. If the subscription died silently
+   we reconnect; if it's alive we still pull fresh data because realtime
+   may have missed events during a throttled period. */
+function onAppFocused() {
+  if (!CLOUD.url || !CLOUD.anonKey || !CLOUD.enabled) return;
+  if (!CLOUD.connected) {
+    _cloudReconnectAttempts = 0; // immediate retry — user intent
+    if (_cloudReconnectTimer) { clearTimeout(_cloudReconnectTimer); _cloudReconnectTimer = null; }
+    connectCloud().catch(() => {}); // its success path pulls fresh data
+  } else {
+    pullFreshFromCloud().catch(() => {});
+  }
+}
+
+function onNetworkOnline() {
+  if (!CLOUD.url || !CLOUD.anonKey || !CLOUD.enabled) return;
+  if (!CLOUD.connected) {
+    _cloudReconnectAttempts = 0;
+    if (_cloudReconnectTimer) { clearTimeout(_cloudReconnectTimer); _cloudReconnectTimer = null; }
+    connectCloud().catch(() => {});
+  }
+}
+
+async function disconnectCloud() {
+  if (CLOUD.channel) { try { await CLOUD.channel.unsubscribe(); } catch(e){} CLOUD.channel = null; }
+  CLOUD.client = null;
+  CLOUD.connected = false;
+  CLOUD.status = 'idle';
+  refreshCloudStatusPill();
+}
+
+/* Realtime payload arrives whenever pns_kv changes on the server. The
+   payload's .new field has the row { key, value, updated_at }. We update
+   the local cache via the original (unwrapped) storage, then route the
+   change into state via reloadStateKey. Re-render at the end so the UI
+   reflects whatever changed. */
+async function handleCloudRealtime(payload) {
+  const row = payload.new || payload.old;
+  if (!row || !row.key) return;
+  // Ignore changes to our own writes (the cloud will echo them back). The
+  // simplest reliable filter: compare value to whatever we last wrote. We
+  // don't have that exact tracking, so we just always reload — re-rendering
+  // is cheap. If self-echo causes a no-op render, that's fine.
+  if (payload.eventType === 'DELETE') {
+    await ORIG_STORAGE.delete(row.key, SHARED);
+  } else {
+    await ORIG_STORAGE.set(row.key, row.value, SHARED);
+  }
+  await reloadStateKey(row.key);
+  CLOUD.lastSyncAt = Date.now();
+  refreshCloudStatusPill();
+  if (typeof render === 'function') render();
+}
+
+/* Given a KEYS-table key like 'pns:items', reload that slice of state
+   from the (now-updated) local cache so the UI re-renders with fresh
+   data. Mirrors the per-type handling in loadAll. */
+async function reloadStateKey(key) {
+  // Find which "type" this key belongs to by inverting the KEYS lookup.
+  const type = Object.keys(KEYS).find(t => KEYS[t] === key);
+  if (!type) return;
+  const r = await ORIG_STORAGE.get(key, SHARED);
+  const raw = r ? r.value : null;
+  if (raw == null) return;
+  try {
+    if (type === 'audit')          state.audit = JSON.parse(raw);
+    else if (type === 'actionLog') state.actionLog = JSON.parse(raw);
+    else if (type === 'theme') {
+      const v = JSON.parse(raw);
+      if (VALID_THEME_NAMES.includes(v)) { state.theme = v; applyTheme(); }
+    }
+    else if (type === 'logo') {
+      const v = JSON.parse(raw);
+      if (v === null) { state.logo = null; applyLogo(); }
+      else if (typeof v === 'string' && v.startsWith('data:image/png;base64,')) { state.logo = v; applyLogo(); }
+    }
+    // v59 (Request 2): viewMode is per-device now. Any cloud update is
+    // intentionally IGNORED here — the local device decides its mode.
+    // Stale cloud values from pre-v59 are migrated once at boot via
+    // migrateViewModeFromCloud, then never read again.
+    else if (type === 'loginAttempts') {
+      const v = JSON.parse(raw);
+      if (v && typeof v === 'object') state.loginAttempts = v;
+    }
+    else if (type === 'itemsColumns') {
+      const v = JSON.parse(raw);
+      if (v && typeof v === 'object') {
+        state.itemsColumnPrefs = {
+          order:  Array.isArray(v.order)  ? v.order.filter(x => typeof x === 'string')  : [],
+          hidden: Array.isArray(v.hidden) ? v.hidden.filter(x => typeof x === 'string') : []
+        };
+        reconcileItemsColumnPrefs();
+      }
+    }
+    else if (type === 'itemsColumnsMobile') {
+      // v55 (Request 3): mobile counterpart to itemsColumns.
+      const v = JSON.parse(raw);
+      if (v && typeof v === 'object') {
+        state.itemsColumnPrefsMobile = {
+          order:  Array.isArray(v.order)  ? v.order.filter(x => typeof x === 'string')  : [],
+          hidden: Array.isArray(v.hidden) ? v.hidden.filter(x => typeof x === 'string') : []
+        };
+        reconcileItemsColumnPrefs();
+      }
+    }
+    else if (type === 'categoryItemsColumns') {
+      const v = JSON.parse(raw);
+      if (v && typeof v === 'object') {
+        state.categoryItemsColumnPrefs = {
+          order:  Array.isArray(v.order)  ? v.order.filter(x => typeof x === 'string')  : [],
+          hidden: Array.isArray(v.hidden) ? v.hidden.filter(x => typeof x === 'string') : []
+        };
+        reconcileCategoryItemsColumnPrefs();
+      }
+    }
+    else if (type === 'dashboardCards') {
+      const v = JSON.parse(raw);
+      if (v && typeof v === 'object' && Array.isArray(v.hidden)) {
+        state.dashboardHiddenCards = v.hidden.filter(x => typeof x === 'string');
+      }
+    }
+    else state.data[type] = JSON.parse(raw);
+  } catch (e) { /* malformed cloud value — keep local */ }
+}
+
+/* Push every locally-known key to cloud. Used by "Migrate local → cloud"
+   on first setup, or when the user wants to force-sync. Returns counts. */
+async function pushLocalToCloud(onProgress) {
+  if (!CLOUD.client) throw new Error('Cloud not connected');
+  const keys = Object.values(KEYS);
+  let ok = 0, failed = 0; const errors = [];
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    if (typeof onProgress === 'function') onProgress(i, keys.length, k);
+    const r = await ORIG_STORAGE.get(k, SHARED);
+    if (!r || r.value == null) continue;
+    try {
+      const { error } = await CLOUD.client.from('pns_kv').upsert({ key: k, value: r.value });
+      if (error) { failed++; errors.push(`${k}: ${error.message}`); }
+      else ok++;
+    } catch (e) { failed++; errors.push(`${k}: ${e.message}`); }
+  }
+  CLOUD.lastSyncAt = Date.now();
+  refreshCloudStatusPill();
+  return { ok, failed, errors };
+}
+
+/* Pull every cloud-known key into local cache + state. Used on a NEW
+   device to bootstrap. Overwrites local. After this, loadAll() / render()
+   should be called by the caller. */
+async function pullCloudToLocal(onProgress) {
+  if (!CLOUD.client) throw new Error('Cloud not connected');
+  const { data, error } = await CLOUD.client.from('pns_kv').select('key, value');
+  if (error) throw error;
+  let count = 0;
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    if (typeof onProgress === 'function') onProgress(i, data.length, row.key);
+    await ORIG_STORAGE.set(row.key, row.value, SHARED);
+    count++;
+  }
+  CLOUD.lastSyncAt = Date.now();
+  refreshCloudStatusPill();
+  return { count };
+}
+
+/* Update the topbar status pill. Called whenever CLOUD.status changes. */
+function refreshCloudStatusPill() {
+  const el = document.getElementById('cloudStatusPill');
+  if (!el) return;
+  const cfg = !!(CLOUD.url && CLOUD.anonKey);
+  let label, cls, title;
+  if (!cfg)                          { label = '☁ NOT SET UP';   cls = 'cloud-status-idle';      title = 'Cloud sync is not configured · Settings → Cloud Sync'; }
+  else if (!CLOUD.enabled)           { label = '☁ DISABLED';     cls = 'cloud-status-idle';      title = 'Cloud sync is configured but disabled'; }
+  else if (CLOUD.status === 'connecting') { label = '☁ CONNECTING'; cls = 'cloud-status-sync'; title = 'Connecting to cloud…'; }
+  else if (CLOUD.status === 'syncing')    { label = '☁ SYNCING';   cls = 'cloud-status-sync';    title = 'Syncing…'; }
+  else if (CLOUD.status === 'error')      { label = '☁ OFFLINE';   cls = 'cloud-status-error';   title = 'Cloud unreachable: ' + (CLOUD.lastError || 'unknown error'); }
+  else if (CLOUD.connected)               { label = '☁ SYNCED';    cls = 'cloud-status-ok';      title = CLOUD.lastSyncAt ? 'Last sync: ' + new Date(CLOUD.lastSyncAt).toLocaleTimeString() : 'Connected'; }
+  else                                    { label = '☁ OFFLINE';   cls = 'cloud-status-error';   title = 'Not connected'; }
+  el.textContent = label;
+  el.className = 'cloud-status-pill ' + cls;
+  el.title = title;
+}
+
+/* ---------- WRAPPED window.storage ----------
+   Saves ORIG_STORAGE (the polyfill above OR Claude's native window.storage)
+   and replaces window.storage with a cloud-aware version. Existing call
+   sites (saveType, safeGet, loadAll, view-mode/theme save helpers) work
+   unchanged — they call window.storage.{get, set, delete, list} as before.
+   When cloud is connected, those calls additionally mirror to/from cloud. */
+const ORIG_STORAGE = window.storage;
+window.storage = {
+  async get(key, shared) {
+    // Prefer cloud if connected — it's the source of truth across devices.
+    if (CLOUD.connected && CLOUD.client) {
+      try {
+        const { data, error } = await CLOUD.client.from('pns_kv').select('value').eq('key', key).maybeSingle();
+        if (!error && data && data.value != null) {
+          // Mirror into local cache so an offline read later has fresh data.
+          await ORIG_STORAGE.set(key, data.value, shared);
+          return { key, value: data.value, shared: !!shared };
+        }
+      } catch (e) { /* fall through to local */ }
+    }
+    return ORIG_STORAGE.get(key, shared);
+  },
+  async set(key, value, shared) {
+    // Always write local first — fast, instant feedback, offline-safe.
+    const localResult = await ORIG_STORAGE.set(key, value, shared);
+    // Mirror to cloud opportunistically. Failures here do NOT break the
+    // local write — they're surfaced via the status pill, not a toast,
+    // because per-keystroke toasts during connectivity blips would spam.
+    if (CLOUD.connected && CLOUD.client) {
+      try {
+        CLOUD.status = 'syncing';
+        refreshCloudStatusPill();
+        const { error } = await CLOUD.client.from('pns_kv').upsert({ key, value });
+        if (error) throw error;
+        CLOUD.status = 'connected';
+        CLOUD.lastError = null;
+        CLOUD.lastSyncAt = Date.now();
+      } catch (e) {
+        CLOUD.status = 'error';
+        CLOUD.lastError = e.message;
+        console.error('[cloud sync] write failed:', e);
+      } finally {
+        refreshCloudStatusPill();
+      }
+    }
+    return localResult;
+  },
+  async delete(key, shared) {
+    const localResult = await ORIG_STORAGE.delete(key, shared);
+    if (CLOUD.connected && CLOUD.client) {
+      try { await CLOUD.client.from('pns_kv').delete().eq('key', key); }
+      catch (e) { console.error('[cloud sync] delete failed:', e); }
+    }
+    return localResult;
+  },
+  async list(prefix, shared) {
+    // For listing, local cache is fine — it's the union of everything
+    // we've ever seen. No need to round-trip to cloud.
+    return ORIG_STORAGE.list(prefix, shared);
+  }
+};
+
+// Read the cloud config synchronously at load time, so subsequent boot
+// logic (loadAll, etc.) knows whether to try the cloud path. The actual
+// connection is established asynchronously via connectCloud() below.
+loadCloudConfigSync();
+const KEYS = {
+  items:      'pns:items',
+  placements: 'pns:placements',
+  customers:  'pns:customers',
+  sites:      'pns:sites',
+  locations:  'pns:locations',
+  categories: 'pns:categories',
+  users:      'pns:users',
+  tags:       'pns:tags',          // (item ⇄ customer) association records · see TAG HELPERS
+  audit:      'pns:audit',
+  actionLog:  'pns:actionLog',
+  theme:      'pns:theme',
+  // v59 (Request 2): viewMode moved OUT of the cloud-synced KEYS registry
+  // and into per-device localStorage (see VIEW_MODE_KEY + saveViewMode /
+  // loadViewModeFromStorage / migrateViewModeFromCloud). Each device now
+  // keeps its own setting — toggling 'mobile' on a phone doesn't flip a
+  // laptop to mobile on its next sync. Existing cloud values are migrated
+  // once on the first boot per device, then ignored.
+  loginAttempts: 'pns:loginAttempts',
+  itemsColumns: 'pns:itemsColumns', // { order: [keys], hidden: [keys] } — web view items-column prefs
+  // v55 (Request 3): separate column prefs for mobile view mode so the
+  // mobile default can show just Item# / Name / List $ while web stays
+  // full-featured. Same shape as itemsColumns; activeItemsColumnPrefs()
+  // picks the right one based on state.viewMode.
+  itemsColumnsMobile: 'pns:itemsColumnsMobile',
+  categoryItemsColumns: 'pns:categoryItemsColumns', // { order, hidden } · same shape as itemsColumns but for the Categories tab tables (v49)
+  dashboardCards:       'pns:dashboardCards',       // { hidden: [card-keys] } · which Dashboard stat cards are hidden (v49)
+  logo:         'pns:logo'           // optional custom brand-mark · data URL (image/png) · only the Jake Hardin profile can change · null = default P&S chevron
+};
+
+/* ---------- PASSWORD CRYPTO ----------
+   PBKDF2-SHA256 with a per-user random salt and high iteration count.
+   The Web Crypto API handles all of this in the browser; nothing leaves
+   the device. Hash, salt, and the iteration count used at hash time are
+   all stored on the user record so iterations can be raised later
+   without breaking older accounts.
+
+   Honest scope note: every record in this app — including users — is
+   stored via window.storage with SHARED=true, which means every signed-in
+   user can read every other user's password hash + salt. PBKDF2 with
+   250,000 iterations makes offline brute-forcing slow, but the strength
+   of any individual account ultimately depends on the password chosen.
+   For server-side hash storage you would need a backend; this is the
+   best we can do client-side. */
+const PASSWORD_ITERATIONS = 250000;
+const PASSWORD_MIN_LENGTH = 8;
+
+function _b64encodeBytes(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+function _b64decodeBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function generateSalt() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return _b64encodeBytes(bytes);
+}
+async function hashPassword(password, saltB64, iterations) {
+  const iters = iterations || PASSWORD_ITERATIONS;
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: _b64decodeBytes(saltB64), iterations: iters, hash: 'SHA-256' },
+    keyMaterial,
+    256
+  );
+  return _b64encodeBytes(new Uint8Array(bits));
+}
+async function verifyPassword(password, user) {
+  if (!user || !user.passwordHash || !user.passwordSalt) return false;
+  const iters = user.passwordIterations || PASSWORD_ITERATIONS;
+  const computed = await hashPassword(password, user.passwordSalt, iters);
+  // Constant-time-ish compare to avoid leaking partial-match timing.
+  if (computed.length !== user.passwordHash.length) return false;
+  let diff = 0;
+  for (let i = 0; i < computed.length; i++) {
+    diff |= computed.charCodeAt(i) ^ user.passwordHash.charCodeAt(i);
+  }
+  return diff === 0;
+}
+function passwordStrengthIssue(password) {
+  if (!password) return 'Password is required';
+  if (password.length < PASSWORD_MIN_LENGTH) return `Password must be at least ${PASSWORD_MIN_LENGTH} characters`;
+  return null;
+}
+
+/* ---------- LOGIN ATTEMPT RATE LIMITING ----------
+   Per-user counter persisted across reloads. After LOCKOUT_THRESHOLD
+   consecutive failures, the account is locked for an exponentially
+   increasing duration; successful sign-in resets the counter.
+
+   Honest scope note: because state lives in shared client storage, a
+   determined attacker with browser access can edit storage to clear
+   the lock. This is a deterrent against casual brute-forcing — the
+   real defense is still a strong password. */
+const LOCKOUT_THRESHOLD = 3; // start locking after this many consecutive failures
+const LOCKOUT_DURATIONS_S = [30, 60, 120, 300, 600, 900]; // seconds; cap at last entry
+
+function lockoutDurationFor(failedCount) {
+  // failedCount === 3 -> 30s, 4 -> 60s, ... cap at 900s.
+  const idx = Math.max(0, failedCount - LOCKOUT_THRESHOLD);
+  return LOCKOUT_DURATIONS_S[Math.min(idx, LOCKOUT_DURATIONS_S.length - 1)];
+}
+function getLockoutEntry(userId) {
+  return (state.loginAttempts && state.loginAttempts[userId]) || null;
+}
+function getLockoutStatus(userId) {
+  const e = getLockoutEntry(userId);
+  if (!e) return { locked: false, failedCount: 0, secondsRemaining: 0 };
+  const now = Date.now();
+  if (e.lockUntil && e.lockUntil > now) {
+    return { locked: true, failedCount: e.failedCount, secondsRemaining: Math.ceil((e.lockUntil - now) / 1000) };
+  }
+  return { locked: false, failedCount: e.failedCount || 0, secondsRemaining: 0 };
+}
+async function recordFailedAttempt(userId) {
+  if (!state.loginAttempts) state.loginAttempts = {};
+  const prev = state.loginAttempts[userId] || { failedCount: 0 };
+  const failedCount = (prev.failedCount || 0) + 1;
+  const entry = { failedCount, lastFailedAt: Date.now() };
+  if (failedCount >= LOCKOUT_THRESHOLD) {
+    entry.lockUntil = Date.now() + lockoutDurationFor(failedCount) * 1000;
+  }
+  state.loginAttempts[userId] = entry;
+  try { await window.storage.set(KEYS.loginAttempts, JSON.stringify(state.loginAttempts), SHARED); }
+  catch(e) { /* non-fatal */ }
+  return entry;
+}
+async function clearFailedAttempts(userId) {
+  if (!state.loginAttempts || !state.loginAttempts[userId]) return;
+  delete state.loginAttempts[userId];
+  try { await window.storage.set(KEYS.loginAttempts, JSON.stringify(state.loginAttempts), SHARED); }
+  catch(e) { /* non-fatal */ }
+}
+function formatLockoutTime(secs) {
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return m > 0 ? `${m}:${String(s).padStart(2,'0')}` : `${s}s`;
+}
+
+/* ---------- ENTITY DEFINITIONS ---------- */
+const ENTITIES = {
+  items: {
+    label: 'Items', singular: 'Item',
+    fields: [
+      // v62 (Request 1): itemNumber gets a "⚡ GENERATE" button next to
+      // the input so the user can auto-fill the next ITEM-N sequence
+      // rather than typing one. The button writes through to
+      // state.formData.itemNumber via generateAndFillItemNumber, which
+      // also updates the input's DOM value in place.
+      { key: 'itemNumber',  label: 'Item Number', required: true,  type: 'text', unique: true, mono: true, generate: true, placeholder: 'e.g. IT-LAPTOP-001' },
+      { key: 'name',        label: 'Item Name',   required: false, type: 'text', placeholder: 'e.g. Dell Latitude 5550' },
+      { key: 'categoryId',  label: 'Category',    required: false, type: 'select-category' },
+      { key: 'cost',        label: 'Cost',        required: false, type: 'currency' },
+      { key: 'listPrice',   label: 'List Price',  required: false, type: 'currency' },
+      { key: 'salesPrice',  label: 'Sales Price', required: false, type: 'currency' },
+      { key: 'minStock',    label: 'Min Stock',   required: false, type: 'number', placeholder: 'e.g. 10', help: 'Optional · trigger a low-stock alert when total quantity across all placements falls below this threshold · leave blank to disable' },
+      { key: 'description', label: 'Description', required: false, type: 'textarea', full: true, placeholder: 'Item description · model, specs, supplier' },
+      { key: 'notes',       label: 'Notes',       required: false, type: 'textarea', full: true, placeholder: 'Operational notes · condition, warnings, internal info' },
+      { key: 'image',       label: 'Image (PNG / JPEG)',  required: false, type: 'image',    full: true }
+    ]
+  },
+  placements: {
+    label: 'Placements', singular: 'Placement',
+    fields: [
+      { key: 'itemId',     label: 'Item',     required: true,  type: 'select-item' },
+      { key: 'siteId',     label: 'Site',     required: true,  type: 'select-site' },
+      { key: 'locationId', label: 'Location', required: true,  type: 'select-location', help: 'Filtered by selected site' },
+      { key: 'quantity',   label: 'Quantity', required: true,  type: 'number', placeholder: 'e.g. 12', help: 'Units of this item at this site/location' }
+    ]
+  },
+  sites: {
+    label: 'Sites', singular: 'Site',
+    fields: [
+      { key: 'name',        label: 'Site Name',           required: true,  type: 'text', unique: true, full: true, placeholder: 'e.g. Main Warehouse' },
+      { key: 'description', label: 'Description / Notes', required: false, type: 'textarea', full: true }
+    ]
+  },
+  locations: {
+    label: 'Locations', singular: 'Location',
+    fields: [
+      { key: 'siteId', label: 'Site',          required: true, type: 'select-site' },
+      { key: 'name',   label: 'Location Name', required: true, type: 'text', placeholder: 'e.g. Aisle 7, Bin 3' }
+    ]
+  },
+  categories: {
+    label: 'Categories', singular: 'Category',
+    fields: [
+      { key: 'name',     label: 'Category Name', required: true,  type: 'text', unique: true, full: true, placeholder: 'e.g. Power Tools' },
+      { key: 'parentId', label: 'Parent Category', required: false, type: 'select-parent-category', help: 'Leave blank for a top-level category · only top-level categories can be selected as parents (2-level depth only)' }
+    ]
+  },
+  customers: {
+    label: 'Customers', singular: 'Customer',
+    fields: [
+      { key: 'customerName', label: 'Customer Name', required: true,  type: 'text', unique: true, full: true, placeholder: 'e.g. Acme Construction Co.' },
+      { key: 'firstName',    label: 'First Name',    required: false, type: 'text' },
+      { key: 'lastName',     label: 'Last Name',     required: false, type: 'text' },
+      { key: 'company',      label: 'Company',       required: false, type: 'text' },
+      { key: 'department',   label: 'Department',    required: false, type: 'text' },
+      { key: 'phone',        label: 'Phone',         required: false, type: 'tel',   placeholder: '(555) 123-4567' },
+      { key: 'email',        label: 'Email',         required: false, type: 'email', placeholder: 'name@example.com' },
+      { key: 'website',      label: 'Website',       required: false, type: 'url',   placeholder: 'https://example.com' }
+    ]
+  },
+  users: {
+    label: 'Users', singular: 'User',
+    fields: [
+      { key: 'firstName', label: 'First Name', required: true, type: 'text' },
+      { key: 'lastName',  label: 'Last Name',  required: true, type: 'text' },
+      { key: 'email',     label: 'Email',      required: true, type: 'email', unique: true, placeholder: 'name@example.com' },
+      { key: 'title',     label: 'Title',      required: true, type: 'text', placeholder: 'e.g. Warehouse Manager' },
+      // v50 (Item 6): optional profile picture · PNG or JPEG · click-or-drop
+      // via the standard image-drop component. The same component used by
+      // item images so we get file picker + drag-drop + size validation +
+      // auto-resize for free. Stored as a base64 data URL on the user
+      // record's `profileImage` attribute.
+      { key: 'profileImage', label: 'Profile Picture (PNG / JPEG)', required: false, type: 'image', full: true },
+      { key: 'password',  label: 'Password',   required: true, type: 'password', full: true,
+        help: 'Required for new users · ≥ 8 characters · stored hashed and salted (PBKDF2-SHA256, 250k iterations) · on edit, leave blank to keep the existing password' }
+    ]
+  }
+};
+
+/* ---------- LIST COLUMN DEFINITIONS ----------
+   Each column has:
+     · key        — stable id used by the items-column-prefs system to track
+                    reorder + visibility. Never reused for a different column.
+     · label      — header text shown in the table
+     · prefLabel  — (items only) display name in the Columns popover when
+                    `label` is empty (e.g. the thumbnail column).
+     · render     — (value) => html for the cell
+
+   When the items column ordering or visibility is customized at runtime the
+   columns ARRAY ORDER below acts as the default — see DEFAULT_ITEMS_COL_ORDER. */
+/* v60 (Request 1): renders the clickable Item # cell used by both the
+   Items tab (LIST_COLS.items[number]) and the Categories tab
+   (LIST_COLS.categoryItems[itemNumber]). On mobile, the displayed text
+   is capped — long item numbers are truncated and a "…" appended so
+   the visible width stays within the budget. Title attribute always
+   carries the un-truncated value so a long-press / hover reveals the
+   full number.
+   v65: cap dropped from 14 → 6 visible chars to fit more columns on
+   the screen on phones. 5 data chars + ellipsis = 6 visible. */
+function renderItemNumberCell(itemId, itemNumber) {
+  const raw = itemNumber == null ? '' : String(itemNumber);
+  const truncated = (state.viewMode === 'mobile' && raw.length > 6)
+    ? raw.slice(0, 5) + '…'
+    : raw;
+  // Title text: full item number + edit hint (the cell IS the edit button
+  // since v57, so users may not realize they can click — the hint helps).
+  const title = raw ? `${raw} · click to edit` : 'click to edit';
+  return `<span class="id-tag clickable" role="button" tabindex="0"`
+    + ` onclick="openForm('items','${itemId}')"`
+    + ` onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openForm('items','${itemId}');}"`
+    + ` title="${escapeHtml(title)}">${escapeHtml(truncated)}</span>`;
+}
+
+const LIST_COLS = {
+  items: [
+    { key: 'thumb',     label: '',          prefLabel: 'Image',  render: r => `<div class="item-thumb">${r.image ? `<img src="${r.image}" alt="">` : 'NO IMG'}</div>` },
+    { key: 'number',    label: 'Item #',    render: r => renderItemNumberCell(r.id, r.itemNumber) },
+    { key: 'name',      label: 'Name',      render: r => r.name ? `<strong>${escapeHtml(r.name)}</strong>` : '<span class="muted">—</span>' },
+    { key: 'category',  label: 'Category',  render: r => { if (!r.categoryId) return '<span class="muted">—</span>'; const c = state.data.categories.find(x => x.id === r.categoryId); if (!c) return `<span class="badge red">— missing —</span>`; const path = categoryPathName(r.categoryId); return `<span class="badge cyan">${escapeHtml(path)}</span>`; } },
+    { key: 'placements',label: 'Placements',render: r => {
+        // v61 (Request 3): the count is now clickable — opens a modal
+        // listing every (site, location, qty) row for the item so the
+        // user can answer "where are these and how many at each spot"
+        // without leaving the Items tab. Zero-placement items still
+        // show a muted dash (nothing to click).
+        const n = state.data.placements.filter(p => p.itemId === r.id).length;
+        if (!n) return '<span class="muted">—</span>';
+        return `<span class="badge orange clickable" role="button" tabindex="0"`
+          + ` onclick="event.stopPropagation(); openItemPlacementsModal('${r.id}')"`
+          + ` onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openItemPlacementsModal('${r.id}');}"`
+          + ` title="Click to see placement details">${n}</span>`;
+      } },
+    { key: 'totalQty',  label: 'Total Qty', render: r => {
+        // Plain quantity — the Status column now carries the low/out alert,
+        // so the inline "⚠ LOW · min N" badge that used to live here was
+        // dropped as redundant (and visually duplicative).
+        const q = totalQtyForItem(r.id);
+        return q ? `<span class="mono">${q.toLocaleString()}</span>` : '<span class="muted">—</span>';
+      } },
+    { key: 'status',    label: 'Status',    render: r => {
+        const s = stockStatus(r);
+        // Title attribute spells out the rule that triggered this state — saves the user
+        // hunting through Items list & Categories accordion to figure out "why is this red".
+        const min = r.minStock != null && r.minStock !== '' ? Number(r.minStock) : null;
+        const qty = totalQtyForItem(r.id);
+        let title = '';
+        if (s === 'out-of-stock') title = `Zero quantity across all sites${min ? ` · min ${min.toLocaleString()}` : ''}`;
+        else if (s === 'low-stock') title = `${qty.toLocaleString()} on hand · below min ${min.toLocaleString()}`;
+        else title = min ? `${qty.toLocaleString()} on hand · min ${min.toLocaleString()}` : `${qty.toLocaleString()} on hand · no minimum set`;
+        return `<span class="status-pill ${s}" title="${escapeHtml(title)}">${STOCK_STATUS_LABEL[s]}</span>`;
+      } },
+    { key: 'cost',      label: 'Cost',      render: r => r.cost != null && r.cost !== '' ? `<span class="mono">${fmt$(r.cost)}</span>` : '<span class="muted">—</span>' },
+    { key: 'listPrice', label: 'List $',    render: r => r.listPrice != null && r.listPrice !== '' ? `<span class="mono">${fmt$(r.listPrice)}</span>` : `<span class="muted">—</span>` },
+    { key: 'salesPrice',label: 'Sales $',   render: r => r.salesPrice != null && r.salesPrice !== '' ? `<span class="mono">${fmt$(r.salesPrice)}</span>` : `<span class="muted">—</span>` },
+    { key: 'totalCost', label: 'Total Cost',render: r => { if (r.cost == null || r.cost === '') return '<span class="muted">—</span>'; const q = totalQtyForItem(r.id); return q ? `<strong class="mono">${fmt$(q*Number(r.cost))}</strong>` : '<span class="muted">—</span>'; } }
+  ],
+  /* v49: schema for the per-category tables on the Categories tab. Same
+     stable-key + render(r) pattern as LIST_COLS.items so all the column-
+     prefs machinery applies uniformly. Differences vs items:
+       · qty/lineCost are scope-aware (read state.workingSiteIds)
+       · the inline "⚠ LOW" badge that used to live in the Name cell was
+         dropped — the Status pill column replaces it
+       · no thumb/category/placements columns — those don't apply here
+         since each section already groups by category */
+  categoryItems: [
+    // v55 (Request 4): if an item number is long enough to touch the Name
+    // column on a narrow viewport, cap the id-tag width and let it ellipsis.
+    // Scoped to the per-category tables (.cat-body) only — the Items list's
+    // id-tag is unaffected. The matching render() call now adds a title=""
+    // attribute so the user can long-press / hover to see the full number.
+    // v57 (Request 1): id-tag is now the row's edit target — clicking it
+    // (or pressing Enter/Space when focused) opens the item edit form.
+    // Per-row EDIT button removed in the same release.
+    // v60 (Request 1): the truncation logic now lives in renderItemNumberCell
+    // — strict 14-char visible cap on mobile, no truncation on desktop.
+    { key: 'itemNumber', label: 'Item #',    render: r => renderItemNumberCell(r.id, r.itemNumber) },
+    { key: 'name',       label: 'Name',      render: r => r.name ? escapeHtml(r.name) : '<span class="muted">—</span>' },
+    { key: 'cost',       label: 'Cost',      render: r => r.cost != null && r.cost !== '' ? `<span class="mono">${fmt$(r.cost)}</span>` : '<span class="muted">—</span>' },
+    { key: 'listPrice',  label: 'List $',    render: r => r.listPrice != null && r.listPrice !== '' ? `<span class="mono">${fmt$(r.listPrice)}</span>` : '<span class="muted">—</span>' },
+    { key: 'salesPrice', label: 'Sales $',   render: r => r.salesPrice != null && r.salesPrice !== '' ? `<span class="mono">${fmt$(r.salesPrice)}</span>` : '<span class="muted">—</span>' },
+    { key: 'qty',        label: 'Qty',       render: r => {
+        // Scope-aware: empty scope set → global total; otherwise summed across selected sites only.
+        const q = totalQtyForItemInScope(r.id, workingSiteSetPruned());
+        return q ? `<span class="mono">${q.toLocaleString()}</span>` : '<span class="muted">—</span>';
+      } },
+    { key: 'lineCost',   label: 'Line Cost', render: r => {
+        if (r.cost == null || r.cost === '') return '<span class="muted">—</span>';
+        const q = totalQtyForItemInScope(r.id, workingSiteSetPruned());
+        return q ? `<strong class="mono">${fmt$(q * Number(r.cost))}</strong>` : '<span class="muted">—</span>';
+      } },
+    { key: 'status',     label: 'Status',    render: r => {
+        // Mirrors the Items tab status column — global (totalQtyForItem),
+        // not scope-aware, so the Status meaning is consistent across the
+        // app: "this item is low/out across our whole inventory" rather
+        // than "in the currently-selected sites".
+        const s = stockStatus(r);
+        const min = r.minStock != null && r.minStock !== '' ? Number(r.minStock) : null;
+        const qty = totalQtyForItem(r.id);
+        let title = '';
+        if (s === 'out-of-stock') title = `Zero quantity across all sites${min ? ` · min ${min.toLocaleString()}` : ''}`;
+        else if (s === 'low-stock') title = `${qty.toLocaleString()} on hand · below min ${min.toLocaleString()}`;
+        else title = min ? `${qty.toLocaleString()} on hand · min ${min.toLocaleString()}` : `${qty.toLocaleString()} on hand · no minimum set`;
+        return `<span class="status-pill ${s}" title="${escapeHtml(title)}">${STOCK_STATUS_LABEL[s]}</span>`;
+      } }
+  ],
+  placements: [
+    { label: 'Item #',  render: r => { const i = state.data.items.find(x => x.id === r.itemId); return i ? `<span class="id-tag">${escapeHtml(i.itemNumber)}</span>` : `<span class="badge red">— missing —</span>`; } },
+    { label: 'Item Name', render: r => { const i = state.data.items.find(x => x.id === r.itemId); return i && i.name ? escapeHtml(i.name) : '<span class="muted">—</span>'; } },
+    { label: 'Site',    render: r => { const s = state.data.sites.find(x => x.id === r.siteId); return s ? `<span class="badge orange">${escapeHtml(s.name)}</span>` : `<span class="badge red">— missing —</span>`; } },
+    { label: 'Location', render: r => { if (!r.locationId) return '<span class="muted">—</span>'; const l = state.data.locations.find(x => x.id === r.locationId); return l ? escapeHtml(l.name) : '<span class="muted">—</span>'; } },
+    { label: 'Qty',      render: r => r.quantity != null && r.quantity !== '' ? `<strong class="mono">${Number(r.quantity).toLocaleString()}</strong>` : '<span class="muted">—</span>' },
+    { label: 'Line Cost', render: r => { const i = state.data.items.find(x => x.id === r.itemId); if (!i || i.cost == null || i.cost === '' || r.quantity == null || r.quantity === '') return '<span class="muted">—</span>'; return `<span class="mono">${fmt$(Number(r.quantity)*Number(i.cost))}</span>`; } }
+  ],
+  sites: [
+    { label: 'Site Name',   render: r => `<strong>${escapeHtml(r.name)}</strong>` },
+    { label: 'Locations',   render: r => { const n = state.data.locations.filter(l => l.siteId === r.id).length; return n ? `<span class="badge cyan">${n}</span>` : '<span class="muted">—</span>'; } },
+    { label: 'Placements',  render: r => { const n = state.data.placements.filter(p => p.siteId === r.id).length; return n ? `<span class="badge amber">${n}</span>` : '<span class="muted">—</span>'; } },
+    { label: 'Description', render: r => r.description ? `<span class="muted truncate">${escapeHtml(r.description)}</span>` : `<span class="muted">—</span>` }
+  ],
+  locations: [
+    { label: 'Site',          render: r => { const s = state.data.sites.find(x => x.id === r.siteId); return s ? `<span class="badge cyan">${escapeHtml(s.name)}</span>` : `<span class="badge red">— missing —</span>`; } },
+    { label: 'Location Name', render: r => `<strong>${escapeHtml(r.name)}</strong>` },
+    { label: 'Placements',    render: r => {
+        // v61 (Request 4): the count is now clickable — opens a modal
+        // listing every (item, qty) row placed at this location.
+        const n = state.data.placements.filter(p => p.locationId === r.id).length;
+        if (!n) return '<span class="muted">—</span>';
+        return `<span class="badge amber clickable" role="button" tabindex="0"`
+          + ` onclick="event.stopPropagation(); openLocationPlacementsModal('${r.id}')"`
+          + ` onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openLocationPlacementsModal('${r.id}');}"`
+          + ` title="Click to see what's placed here">${n}</span>`;
+      } }
+  ],
+  categories: [
+    { label: 'Category Name', render: r => `<strong>${escapeHtml(r.name)}</strong>` },
+    { label: 'Parent',        render: r => { if (!r.parentId) return '<span class="muted">—</span>'; const p = state.data.categories.find(x => x.id === r.parentId); return p ? `<span class="badge cyan">${escapeHtml(p.name)}</span>` : `<span class="badge red">— missing —</span>`; } },
+    { label: 'Items',         render: r => { const n = state.data.items.filter(i => i.categoryId === r.id).length; return n ? `<span class="badge amber">${n}</span>` : '<span class="muted">—</span>'; } }
+  ],
+  customers: [
+    { label: 'Customer Name', render: r => `<strong>${escapeHtml(r.customerName)}</strong>` },
+    { label: 'Tagged Items',  render: r => { const n = tagsForCustomer(r.id).length; return n ? `<span class="badge orange" title="${n} item${n===1?'':'s'} tagged · click VIEW to see them">${n}</span>` : '<span class="muted">—</span>'; } },
+    { label: 'Contact',       render: r => { const n = [r.firstName,r.lastName].filter(Boolean).join(' '); return n ? escapeHtml(n) : `<span class="muted">—</span>`; } },
+    { label: 'Company',       render: r => r.company ? escapeHtml(r.company) : `<span class="muted">—</span>` },
+    { label: 'Email',         render: r => r.email ? `<a class="link-mono" href="mailto:${escapeHtml(r.email)}">${escapeHtml(r.email)}</a>` : `<span class="muted">—</span>` },
+    { label: 'Phone',         render: r => r.phone ? `<span class="mono">${escapeHtml(r.phone)}</span>` : `<span class="muted">—</span>` }
+  ],
+  users: [
+    // v51: thumb column · profileImage when set, two-letter initials otherwise.
+    // Reuses the existing .item-thumb component used by the items list so
+    // dimensions/borders stay consistent across tabs.
+    { label: '', render: r => `<div class="item-thumb">${r.profileImage ? `<img src="${escapeHtml(r.profileImage)}" alt="">` : `<span class="user-chip-initials">${escapeHtml(userInitials(r))}</span>`}</div>` },
+    { label: 'Name',  render: r => `<strong>${escapeHtml((r.firstName||'') + ' ' + (r.lastName||'')).trim()}</strong>` },
+    { label: 'Email', render: r => `<a class="link-mono" href="mailto:${escapeHtml(r.email)}">${escapeHtml(r.email)}</a>` },
+    { label: 'Title', render: r => `<span class="badge amber">${escapeHtml(r.title)}</span>` }
+  ]
+};
+
+/* ---------- CSV TARGETS ---------- */
+const CSV_TARGETS = {
+  items: {
+    label: 'Items', entity: 'items',
+    description: 'Item master records · only "itemNumber" is required · site, location, and quantity are imported separately as Placements',
+    requiredCols: ['itemnumber'],
+    optionalCols: ['name','category','cost','listprice','salesprice','minstock','description','notes'],
+    headerLine: 'itemNumber,name,category,cost,listPrice,salesPrice,minStock,description,notes',
+    sample: `itemNumber,name,category,cost,listPrice,salesPrice,minStock,description,notes
+IT-LAPTOP-001,Dell Latitude 5550,Computer Hardware,1450.00,1899.00,1750.00,5,15-inch business laptop,Refurb units have year-old batteries
+CN-DRILL-014,DeWalt 20V Hammer Drill,Power Tools,189.99,249.99,229.99,3,,
+IT-CABLE-CAT6,,,,,,50,,
+IT-MONITOR-027,Dell U2724D 27-inch,Computer Hardware,,,,,,
+SAFETY-VEST-XL,,,,,,,,`,
+    previewCols: [
+      { label: 'Item #', render: r => `<span class="id-tag">${escapeHtml(r.itemNumber||'—')}</span>` },
+      { label: 'Name',   render: r => r.name ? escapeHtml(r.name) : '<span class="muted">—</span>' },
+      { label: 'Cat',    render: r => r.categoryName ? `<span class="mono">${escapeHtml(r.categoryName)}</span>` : '<span class="muted">—</span>' },
+      { label: 'Cost',   render: r => r.cost != null && !isNaN(r.cost) ? `<span class="mono">${fmt$(r.cost)}</span>` : '<span class="muted">—</span>' },
+      { label: 'List',   render: r => r.listPrice != null && !isNaN(r.listPrice) ? `<span class="mono">${fmt$(r.listPrice)}</span>` : '<span class="muted">—</span>' },
+      { label: 'Sales',  render: r => r.salesPrice != null && !isNaN(r.salesPrice) ? `<span class="mono">${fmt$(r.salesPrice)}</span>` : '<span class="muted">—</span>' },
+      { label: 'Min',    render: r => r.minStock != null && !isNaN(r.minStock) ? `<span class="mono">${r.minStock}</span>` : '<span class="muted">—</span>' }
+    ],
+    parseRow(get, seenInFile) {
+      const itemNumber = get('itemnumber');
+      const name = get('name');
+      const categoryName = get('category');
+      const costRaw = get('cost'), lpRaw = get('listprice'), spRaw = get('salesprice'), minRaw = get('minstock');
+      const cost       = costRaw ? parseFloat(costRaw) : null;
+      const listPrice  = lpRaw   ? parseFloat(lpRaw)   : null;
+      const salesPrice = spRaw   ? parseFloat(spRaw)   : null;
+      const minStock   = minRaw  ? parseFloat(minRaw)  : null;
+      const description = get('description');
+      const notes = get('notes');
+      const data = { itemNumber, name, categoryName, cost, listPrice, salesPrice, minStock, description, notes, categoryId: null };
+
+      if (!itemNumber) return { status: 'err', reason: 'itemNumber is required', data };
+      if (cost       !== null && (isNaN(cost)       || cost       < 0)) return { status: 'err', reason: 'Invalid cost',        data };
+      if (listPrice  !== null && (isNaN(listPrice)  || listPrice  < 0)) return { status: 'err', reason: 'Invalid list price',  data };
+      if (salesPrice !== null && (isNaN(salesPrice) || salesPrice < 0)) return { status: 'err', reason: 'Invalid sales price', data };
+      if (minStock   !== null && (isNaN(minStock)   || minStock   < 0)) return { status: 'err', reason: 'Invalid minStock',    data };
+
+      if (categoryName) {
+        const category = state.data.categories.find(c => c.name.toLowerCase() === categoryName.toLowerCase());
+        if (!category) return { status: 'err', reason: `Category "${categoryName}" not found`, data };
+        data.categoryId = category.id;
+      }
+
+      const key = itemNumber.toUpperCase();
+      if (state.data.items.find(i => i.itemNumber.toUpperCase() === key)) return { status: 'dup', reason: 'Already in inventory', data };
+      if (seenInFile.has(key)) return { status: 'dup', reason: 'Duplicate within file', data };
+      seenInFile.add(key);
+      return { status: 'ok', reason: '', data };
+    },
+    commit(rows) {
+      rows.forEach(r => {
+        state.data.items.push({
+          id: uid(), itemNumber: r.itemNumber,
+          name: r.name || null,
+          categoryId: r.categoryId || null,
+          cost:       r.cost       != null && !isNaN(r.cost)       ? r.cost       : null,
+          listPrice:  r.listPrice  != null && !isNaN(r.listPrice)  ? r.listPrice  : null,
+          salesPrice: r.salesPrice != null && !isNaN(r.salesPrice) ? r.salesPrice : null,
+          minStock:   r.minStock   != null && !isNaN(r.minStock)   ? r.minStock   : null,
+          description: r.description || null,
+          notes: r.notes || null,
+          image: null,
+          createdBy: state.user.email, createdAt: Date.now(),
+          lastModifiedBy: state.user.email, lastModifiedAt: Date.now()
+        });
+      });
+    }
+  },
+
+  placements: {
+    label: 'Placements', entity: 'placements',
+    description: 'Assign site, location, and quantity to items · multiple per item allowed · duplicates never flagged',
+    requiredCols: ['itemnumber','site','location','quantity'],
+    optionalCols: [],
+    headerLine: 'itemNumber,site,location,quantity',
+    sample: `itemNumber,site,location,quantity
+IT-LAPTOP-001,Main Warehouse,Aisle 7 Bin 3,8
+IT-LAPTOP-001,IT Storage Room,Server Rack 3,3
+CN-DRILL-014,Construction Yard,Tool Crib,4
+CN-DRILL-014,Main Warehouse,Aisle 4 Bin 12,2
+IT-CABLE-CAT6,Main Warehouse,Aisle 1 Bin A,250
+IT-CABLE-CAT6,IT Storage Room,Network Cabinet,75`,
+    previewCols: [
+      { label: 'Item #',   render: r => `<span class="id-tag">${escapeHtml(r.itemNumber||'—')}</span>` },
+      { label: 'Item',     render: r => { const i = state.data.items.find(x => x.id === r.itemId); return i && i.name ? `<span class="muted">${escapeHtml(i.name)}</span>` : '<span class="muted">—</span>'; } },
+      { label: 'Site',     render: r => `<span class="mono">${escapeHtml(r.siteName||'—')}</span>` },
+      { label: 'Location', render: r => `<span class="mono">${escapeHtml(r.locationName||'—')}</span>` },
+      { label: 'Qty',      render: r => r.quantity != null && !isNaN(r.quantity) ? `<span class="mono"><strong>${r.quantity}</strong></span>` : '<span class="muted">—</span>' }
+    ],
+    parseRow(get /* seenInFile intentionally unused — placements never flag duplicates */) {
+      const itemNumber = get('itemnumber');
+      const siteName = get('site');
+      const locationName = get('location');
+      const qtyRaw = get('quantity');
+      const quantity = (qtyRaw !== '' && qtyRaw != null) ? parseFloat(qtyRaw) : null;
+      const data = { itemNumber, siteName, locationName, quantity, itemId: null, siteId: null, locationId: null };
+
+      if (!itemNumber)        return { status: 'err', reason: 'itemNumber is required', data };
+      if (!siteName)          return { status: 'err', reason: 'site is required', data };
+      if (!locationName)      return { status: 'err', reason: 'location is required', data };
+      if (quantity === null)  return { status: 'err', reason: 'quantity is required', data };
+      if (isNaN(quantity) || quantity < 0) return { status: 'err', reason: 'Invalid quantity', data };
+
+      const item = state.data.items.find(i => i.itemNumber.toLowerCase() === itemNumber.toLowerCase());
+      if (!item) return { status: 'err', reason: `Item "${itemNumber}" not found — import items first`, data };
+      data.itemId = item.id;
+
+      const site = state.data.sites.find(s => s.name.toLowerCase() === siteName.toLowerCase());
+      if (!site) return { status: 'err', reason: `Site "${siteName}" not found`, data };
+      data.siteId = site.id;
+
+      const loc = state.data.locations.find(l => l.siteId === site.id && l.name.toLowerCase() === locationName.toLowerCase());
+      if (!loc) return { status: 'err', reason: `Location "${locationName}" not found at site "${siteName}"`, data };
+      data.locationId = loc.id;
+
+      // Note: we deliberately do NOT check for duplicates against existing
+      // placements or earlier rows in the same file — every row creates a
+      // new placement record, even if (item, site, location, quantity)
+      // already exists. The user wants additive imports.
+      return { status: 'ok', reason: '', data };
+    },
+    commit(rows) {
+      rows.forEach(r => {
+        state.data.placements.push({
+          id: uid(),
+          itemId: r.itemId,
+          siteId: r.siteId,
+          locationId: r.locationId,
+          quantity: r.quantity,
+          createdBy: state.user.email, createdAt: Date.now(),
+          lastModifiedBy: state.user.email, lastModifiedAt: Date.now()
+        });
+      });
+    }
+  },
+
+  sites: {
+    label: 'Sites', entity: 'sites',
+    description: 'Physical sites · only "name" is required',
+    requiredCols: ['name'],
+    optionalCols: ['description'],
+    headerLine: 'name,description',
+    sample: `name,description
+Main Warehouse,Primary distribution facility
+IT Storage Room,Climate-controlled supplies storage
+Job Site - Riverside,Active until Q3 2026
+Equipment Depot,`,
+    previewCols: [
+      { label: 'Site Name',   render: r => `<strong>${escapeHtml(r.name||'—')}</strong>` },
+      { label: 'Description', render: r => r.description ? `<span class="muted">${escapeHtml(r.description)}</span>` : '<span class="muted">—</span>' }
+    ],
+    parseRow(get, seenInFile) {
+      const name = get('name');
+      const description = get('description');
+      const data = { name, description };
+      if (!name) return { status: 'err', reason: 'Missing required field: name', data };
+      const key = name.toLowerCase();
+      if (state.data.sites.find(s => s.name.toLowerCase() === key)) return { status: 'dup', reason: 'Site name already exists', data };
+      if (seenInFile.has(key)) return { status: 'dup', reason: 'Duplicate within file', data };
+      seenInFile.add(key);
+      return { status: 'ok', reason: '', data };
+    },
+    commit(rows) {
+      rows.forEach(r => {
+        state.data.sites.push({
+          id: uid(), name: r.name, description: r.description || '',
+          createdBy: state.user.email, createdAt: Date.now(),
+          lastModifiedBy: state.user.email, lastModifiedAt: Date.now()
+        });
+      });
+    }
+  },
+
+  locations: {
+    label: 'Locations', entity: 'locations',
+    description: 'Locations within sites · "site" and "name" required',
+    requiredCols: ['site','name'],
+    optionalCols: [],
+    headerLine: 'site,name',
+    sample: `site,name
+Main Warehouse,Aisle 1 - Bin A
+Main Warehouse,Aisle 1 - Bin B
+Main Warehouse,Aisle 7 - Pallet Rack
+IT Storage Room,Shelf 3
+Construction Yard,Container North`,
+    previewCols: [
+      { label: 'Site',          render: r => `<span class="mono">${escapeHtml(r.siteName||'—')}</span>` },
+      { label: 'Location Name', render: r => `<strong>${escapeHtml(r.name||'—')}</strong>` }
+    ],
+    parseRow(get, seenInFile) {
+      const siteName = get('site');
+      const name = get('name');
+      const data = { siteName, name, siteId: null };
+      if (!siteName || !name) return { status: 'err', reason: 'Missing required field', data };
+      const site = state.data.sites.find(s => s.name.toLowerCase() === siteName.toLowerCase());
+      if (!site) return { status: 'err', reason: `Site "${siteName}" not found — create it first`, data };
+      data.siteId = site.id;
+      const key = site.id + ':' + name.toLowerCase();
+      if (state.data.locations.find(l => l.siteId === site.id && l.name.toLowerCase() === name.toLowerCase()))
+        return { status: 'dup', reason: 'Location already exists at this site', data };
+      if (seenInFile.has(key)) return { status: 'dup', reason: 'Duplicate within file', data };
+      seenInFile.add(key);
+      return { status: 'ok', reason: '', data };
+    },
+    commit(rows) {
+      rows.forEach(r => {
+        state.data.locations.push({
+          id: uid(), siteId: r.siteId, name: r.name,
+          createdBy: state.user.email, createdAt: Date.now(),
+          lastModifiedBy: state.user.email, lastModifiedAt: Date.now()
+        });
+      });
+    }
+  },
+
+  categories: {
+    label: 'Categories', entity: 'categories',
+    description: 'Item categories · only "name" is required · optional "parent" column to declare a sub-category · the parent must be a top-level category that already exists OR appears earlier in this file',
+    requiredCols: ['name'],
+    optionalCols: ['parent'],
+    headerLine: 'name,parent',
+    sample: `name,parent
+Power Tools,
+Hand Tools,
+Safety Equipment,
+Drills,Power Tools
+Saws,Power Tools
+Hammers,Hand Tools
+Hard Hats,Safety Equipment`,
+    previewCols: [
+      { label: 'Category Name', render: r => `<strong>${escapeHtml(r.name||'—')}</strong>` },
+      { label: 'Parent',        render: r => r.parentName ? `<span class="mono">${escapeHtml(r.parentName)}</span>` : '<span class="muted">—</span>' }
+    ],
+    parseRow(get, seenInFile) {
+      const name = get('name');
+      const parentName = get('parent');
+      const data = { name, parentName, parentId: null };
+      if (!name) return { status: 'err', reason: 'Missing required field: name', data };
+
+      const key = name.toLowerCase();
+      // We piggyback an extra map onto seenInFile to remember per-row info
+      // (whether each name was declared as top-level in this file). Set
+      // instances accept arbitrary expando properties, so this stays inside
+      // the existing CSV pipeline without changing its signature.
+      if (!seenInFile.fileDeclared) seenInFile.fileDeclared = new Map(); // lowercased name -> { hasParent: bool }
+
+      // Dupe checks: against existing data first, then within-file.
+      if (state.data.categories.find(c => c.name.toLowerCase() === key)) return { status: 'dup', reason: 'Category already exists', data };
+      if (seenInFile.has(key)) return { status: 'dup', reason: 'Duplicate within file', data };
+
+      // Parent resolution: existing top-level OR an earlier top-level row in
+      // this file. Sub-of-sub is rejected (depth limit). Forward references
+      // are rejected (the user should order parents before their children).
+      if (parentName) {
+        if (parentName.toLowerCase() === key) {
+          return { status: 'err', reason: 'A category cannot be its own parent', data };
+        }
+        const existingParent = state.data.categories.find(c => c.name.toLowerCase() === parentName.toLowerCase());
+        if (existingParent) {
+          if (existingParent.parentId) {
+            return { status: 'err', reason: `Parent "${parentName}" is itself a sub-category (max depth is 2)`, data };
+          }
+          data.parentId = existingParent.id;
+        } else {
+          // Not in DB — must have been declared earlier in this file as a top-level.
+          const inFile = seenInFile.fileDeclared.get(parentName.toLowerCase());
+          if (!inFile) {
+            return { status: 'err', reason: `Parent "${parentName}" not found (must already exist or appear earlier in this file)`, data };
+          }
+          if (inFile.hasParent) {
+            return { status: 'err', reason: `Parent "${parentName}" is itself declared as a sub-category (max depth is 2)`, data };
+          }
+          data.parentId = '__pending:' + parentName.toLowerCase(); // resolved in commit()
+        }
+      }
+
+      seenInFile.add(key);
+      seenInFile.fileDeclared.set(key, { hasParent: !!parentName });
+      return { status: 'ok', reason: '', data };
+    },
+    commit(rows) {
+      // First pass: insert all top-level rows so within-file sub references
+      // can resolve. Then insert the rest and rewrite any '__pending:'
+      // parentIds to the freshly-minted record ids.
+      const nameToId = new Map(); // lowercased name -> id (for rows added in this run)
+      state.data.categories.forEach(c => nameToId.set(c.name.toLowerCase(), c.id));
+      const tops = rows.filter(r => !r.parentName);
+      const subs = rows.filter(r => r.parentName);
+      tops.forEach(r => {
+        const id = uid();
+        state.data.categories.push({
+          id, name: r.name, parentId: null,
+          createdBy: state.user.email, createdAt: Date.now(),
+          lastModifiedBy: state.user.email, lastModifiedAt: Date.now()
+        });
+        nameToId.set(r.name.toLowerCase(), id);
+      });
+      subs.forEach(r => {
+        let parentId = r.parentId;
+        if (typeof parentId === 'string' && parentId.startsWith('__pending:')) {
+          parentId = nameToId.get(parentId.slice('__pending:'.length)) || null;
+        }
+        state.data.categories.push({
+          id: uid(), name: r.name, parentId,
+          createdBy: state.user.email, createdAt: Date.now(),
+          lastModifiedBy: state.user.email, lastModifiedAt: Date.now()
+        });
+      });
+    }
+  },
+
+  customers: {
+    label: 'Customers', entity: 'customers',
+    description: 'Customer accounts · only "customerName" is required',
+    requiredCols: ['customername'],
+    optionalCols: ['firstname','lastname','company','department','phone','email','website'],
+    headerLine: 'customerName,firstName,lastName,company,department,phone,email,website',
+    sample: `customerName,firstName,lastName,company,department,phone,email,website
+Acme Construction Co.,Sarah,Chen,Acme Construction Co.,Procurement,(555) 123-4567,sarah@acme.com,https://acme.com
+Northern Builders LLC,Mike,Hernandez,Northern Builders LLC,Operations,(555) 987-6543,mike@northernbuilders.com,
+Riverside School District,,,Riverside School District,Facilities,(555) 234-5678,facilities@rusd.edu,https://rusd.edu
+Henderson Family Trust,James,Henderson,,,,,`,
+    previewCols: [
+      { label: 'Customer Name', render: r => `<strong>${escapeHtml(r.customerName||'—')}</strong>` },
+      { label: 'Contact',       render: r => { const n = [r.firstName, r.lastName].filter(Boolean).join(' '); return n ? escapeHtml(n) : '<span class="muted">—</span>'; } },
+      { label: 'Company',       render: r => r.company ? escapeHtml(r.company) : '<span class="muted">—</span>' },
+      { label: 'Email',         render: r => r.email ? `<span class="mono">${escapeHtml(r.email)}</span>` : '<span class="muted">—</span>' },
+      { label: 'Phone',         render: r => r.phone ? `<span class="mono">${escapeHtml(r.phone)}</span>` : '<span class="muted">—</span>' }
+    ],
+    parseRow(get, seenInFile) {
+      const customerName = get('customername');
+      const firstName    = get('firstname');
+      const lastName     = get('lastname');
+      const company      = get('company');
+      const department   = get('department');
+      const phone        = get('phone');
+      const email        = get('email');
+      const website      = get('website');
+      const data = { customerName, firstName, lastName, company, department, phone, email, website };
+      if (!customerName) return { status: 'err', reason: 'Customer name is required', data };
+      if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { status: 'err', reason: 'Invalid email format', data };
+      if (website) {
+        const u = website.includes('://') ? website : 'https://' + website;
+        try { new URL(u); } catch(e) { return { status: 'err', reason: 'Invalid website URL', data }; }
+      }
+      const key = customerName.toLowerCase();
+      if (state.data.customers.find(c => c.customerName.toLowerCase() === key)) return { status: 'dup', reason: 'Customer already exists', data };
+      if (seenInFile.has(key)) return { status: 'dup', reason: 'Duplicate within file', data };
+      seenInFile.add(key);
+      return { status: 'ok', reason: '', data };
+    },
+    commit(rows) {
+      rows.forEach(r => {
+        state.data.customers.push({
+          id: uid(),
+          customerName: r.customerName,
+          firstName:  r.firstName  || null,
+          lastName:   r.lastName   || null,
+          company:    r.company    || null,
+          department: r.department || null,
+          phone:      r.phone      || null,
+          email:      r.email      || null,
+          website:    r.website    || null,
+          createdBy: state.user.email, createdAt: Date.now(),
+          lastModifiedBy: state.user.email, lastModifiedAt: Date.now()
+        });
+      });
+    }
+  }
+};
+
+/* ---------- STATE ---------- */
+const state = {
+  user: null,                     // { id, email, firstName, lastName, title }
+  signinUserId: null,             // when set, sign-in screen shows password prompt for that user
+  loginAttempts: {},              // { userId: { failedCount, lastFailedAt, lockUntil? } }
+  data: { items: [], placements: [], customers: [], sites: [], locations: [], categories: [], users: [], tags: [] },
+  audit: [],
+  actionLog: [],
+  theme: 'dark',
+  logo: null,                     // null = default P&S chevron · or a data URL ('data:image/png;base64,…') set by the Jake Hardin profile via Settings → Logo
+  viewMode: 'web',                // 'web' | 'mobile' — see applyViewMode / toggleViewMode
+  activeTab: 'dashboard',
+  activeLookupTab: 'sites',
+  activeManageTab: 'users',
+  activeItemsTab: 'list',         // 'list' | 'add'  → Items sub-tabs
+  settingsView: 'hub',            // 'hub' | 'import'  → Settings → Import Data flow
+  activeActionsTab: 'add',        // 'add' | 'remove' | 'adjust' | 'move' | 'history'  → Actions sub-tabs
+  // v66: which tab is showing in the Simple view mode. Mirrors activeTab
+  // when in simple mode but separate so we can remember the last-used
+  // simple tab across mode toggles.
+  activeSimpleTab: 'actions',     // 'actions' | 'itemSearch'
+  simpleSearch: '',               // search query on the Simple ITEM SEARCH tab
+  activeCSVTab: 'sites',
+  search: { items: '', placements: '', customers: '', sites: '', locations: '', categories: '', users: '', actionLog: '' },
+  // v62 (Request 2): includeOosInScopeCategories — toggled by clicking
+  // the STATUS column header. When ON and a working site is active,
+  // also surface items with zero placements anywhere whose category is
+  // represented in the user's scope. Lets a warehouse manager see "what
+  // pens used to be at LHD but aren't anymore" without leaving the
+  // working-site view.
+  filters: { items: { category: '', site: '', includeOosInScopeCategories: false } },
+  // v50 (Item 2): tracks whether the user has manually changed the items
+  // site dropdown during the current visit to the Items tab. While false,
+  // every render of the Items tab syncs the dropdown to the global
+  // working-site selection. Flips to true when onItemsSiteFilterChange
+  // fires; resets to false on leaving the Items tab (in render()) or on
+  // changing the working-site (in applyWorkingSiteSelection).
+  _itemsSiteSyncedFromWorking: false,
+  _itemsSiteUserOverride: false,
+  formData: {}, formErrors: {}, activeForm: null,
+  csvPreview: null,
+  auditFilters: { user: '', action: '' },
+  actionFilters: { type: '', item: '' },
+  dashboardSiteFilter: null,  // DEPRECATED · superseded by state.workingSiteIds · field kept (always null) so any stale references during a refresh don't crash before reload
+  categoriesSiteFilter: null, // DEPRECATED · superseded by state.workingSiteIds · same as above
+  workingSiteIds: new Set(),  // Global "working site" scope · empty Set = ALL SITES (default) · otherwise a Set of siteIds that scopes Dashboard and Categories · persisted per-device via WORKING_SITES_KEY
+  expandedCategories: new Set(), // Set of category ids currently expanded in the Categories tab accordion
+  selectedItemIds: new Set(),    // Session-only · ids of items checked on the All Items list · cleared when leaving the Items tab
+  itemsColumnPrefs: { order: [], hidden: [] }, // Persisted · drives the items list column ordering + visibility (see reconcileItemsColumnPrefs)
+  // v55 (Request 3): parallel prefs for the mobile view of the items list.
+  // Initialized empty; populated to mobile defaults on first reconcile.
+  itemsColumnPrefsMobile: { order: [], hidden: [] },
+  categoryItemsColumnPrefs: { order: [], hidden: [] }, // Persisted (v49) · same shape, drives the per-category item tables on the Categories tab
+  columnsPanelOpen: false,       // Session-only · true while a COLUMNS popover is open (items or categoryItems — both share state via the columnsDomain field)
+  columnsDomain: 'items',        // Session-only · 'items' | 'categoryItems' · which domain the open popover is editing (v49)
+  draggingColumnKey: null,       // Session-only · key of the column currently being dragged inside the COLUMNS popover (or null)
+  dashboardHiddenCards: [],      // Persisted (v49) · array of stable card keys hidden from the Dashboard's stat grids
+  dashboardCardsPanelOpen: false,// Session-only · true while the Dashboard MANAGE CARDS popover is open
+  lowStockCollapsed: false,      // Session-only · collapses the Dashboard's Low Stock Alerts card (resets on refresh)
+  // v52 (Request 2): same pattern for Top Categories by Cost and Recent
+  // Activity cards on the Dashboard. Session-only — collapse state resets
+  // on refresh so a user with collapsed cards isn't surprised by hidden
+  // info after coming back. Toggled via toggleDashboardSection(key).
+  dashboardCollapsed: { topCategories: false, recentActivity: false },
+  activeBatchAction: null,       // null | 'add' | 'remove' | 'move'  → batch action modal type currently open
+  batchActionForm: null,         // { siteId, locationId, fromSiteId, fromLocationId, toSiteId, toLocationId, notes, qtyByItem: {id: number} } — populated when a batch modal is open
+  activeCustomerView: null,      // null | customerId → when set, the Customers lookup renders the per-customer detail view instead of the list
+  customerViewFilter: '',        // Session-only · text filter for the customer view's tagged items table
+  tagFormCtx: null,              // { mode: 'add'|'edit', anchor: 'item'|'customer', itemId?, customerId?, tagId?, quantity, notes? } when the tag form modal is open
+  fulfillForm: null,             // { customerId, siteId, locationId, notes, qtyByItem: {id: string} } when the "Remove from Inventory" modal is open on a customer view
+  barcodeSheet: null, // { kind: 'items'|'sites'|'locations'|'items-batch', title, subtitle, subjects: [...] } when the print-barcodes overlay is open
+  activeReport: null  // null = Reports list landing · or 'byCategory' | 'bySite' | 'crossTab' when viewing a single report detail
+};
+
+/* ---------- STORAGE ---------- */
+async function safeGet(key) { try { const r = await window.storage.get(key, SHARED); return r ? r.value : null; } catch(e) { return null; } }
+async function loadAll() {
+  setStatus('LOADING…');
+  for (const [type, key] of Object.entries(KEYS)) {
+    const raw = await safeGet(key);
+    if (raw) {
+      try {
+        if (type === 'audit') state.audit = JSON.parse(raw);
+        else if (type === 'actionLog') state.actionLog = JSON.parse(raw);
+        else if (type === 'theme') {
+          const v = JSON.parse(raw);
+          if (VALID_THEME_NAMES.includes(v)) state.theme = v;
+        }
+        else if (type === 'logo') {
+          const v = JSON.parse(raw);
+          // Only accept a PNG data URL or explicit null. Anything else (an
+          // old format, malformed value, wrong MIME) is ignored so the
+          // brand-mark falls back to the default P&S chevron.
+          if (v === null) state.logo = null;
+          else if (typeof v === 'string' && v.startsWith('data:image/png;base64,')) state.logo = v;
+        }
+        // v59 (Request 2): viewMode is no longer in KEYS — handled by
+        // localStorage now. The old cloud value (if any) is migrated by
+        // migrateViewModeFromCloud, called from boot once per device.
+        else if (type === 'loginAttempts') {
+          const v = JSON.parse(raw);
+          if (v && typeof v === 'object') state.loginAttempts = v;
+        }
+        else if (type === 'itemsColumns') {
+          const v = JSON.parse(raw);
+          if (v && typeof v === 'object') {
+            state.itemsColumnPrefs = {
+              order:  Array.isArray(v.order)  ? v.order.filter(x => typeof x === 'string')  : [],
+              hidden: Array.isArray(v.hidden) ? v.hidden.filter(x => typeof x === 'string') : []
+            };
+          }
+        }
+        else if (type === 'itemsColumnsMobile') {
+          // v55 (Request 3): mobile-only items column prefs. Independent
+          // from itemsColumns so mobile defaults can show fewer columns
+          // without surprising desktop users.
+          const v = JSON.parse(raw);
+          if (v && typeof v === 'object') {
+            state.itemsColumnPrefsMobile = {
+              order:  Array.isArray(v.order)  ? v.order.filter(x => typeof x === 'string')  : [],
+              hidden: Array.isArray(v.hidden) ? v.hidden.filter(x => typeof x === 'string') : []
+            };
+          }
+        }
+        else if (type === 'categoryItemsColumns') {
+          const v = JSON.parse(raw);
+          if (v && typeof v === 'object') {
+            state.categoryItemsColumnPrefs = {
+              order:  Array.isArray(v.order)  ? v.order.filter(x => typeof x === 'string')  : [],
+              hidden: Array.isArray(v.hidden) ? v.hidden.filter(x => typeof x === 'string') : []
+            };
+          }
+        }
+        else if (type === 'dashboardCards') {
+          const v = JSON.parse(raw);
+          if (v && typeof v === 'object' && Array.isArray(v.hidden)) {
+            state.dashboardHiddenCards = v.hidden.filter(x => typeof x === 'string');
+          }
+        }
+        else state.data[type] = JSON.parse(raw);
+      } catch(e){}
+    }
+  }
+  // Reconcile column prefs against the current LIST_COLS schema. Runs even
+  // when no value was loaded (defaults: full order, nothing hidden), so the
+  // state is always valid before any items list rendering.
+  reconcileItemsColumnPrefs();
+  reconcileCategoryItemsColumnPrefs();
+  applyTheme();
+  applyLogo();
+  // v59 (Request 2): viewMode is per-device — load from localStorage
+  // before applyViewMode so the body class reflects the saved preference.
+  // The migration from any pre-v59 cloud value happens later in boot
+  // via migrateViewModeFromCloud (which is a no-op if local already has
+  // a value here).
+  loadViewModeFromStorage();
+  applyViewMode();
+  // v65 (Request 1): on mobile, the Low Stock Alerts card on the Dashboard
+  // defaults to collapsed. Set this once at boot, after viewMode is known,
+  // so the user opens the app to a tight dashboard. The state is still
+  // session-only — once the user expands the card during their session,
+  // it stays open until the next refresh. Web mode keeps the default-
+  // expanded behavior.
+  if (state.viewMode === 'mobile') state.lowStockCollapsed = true;
+
+  // Migration: convert legacy item.siteId/locationId/quantity into placement records.
+  // Older versions stored a single site (and a quantity) directly on each item.
+  // Now items carry identifiers/pricing only, and (item, site, location, quantity)
+  // lives in `placements`. Quantity is moved to the placement during migration;
+  // any items without a siteId have their stale `quantity` simply dropped, since
+  // there's no placement to attach it to.
+  let migrated = 0;
+  let strippedLegacyQty = false;
+  state.data.items.forEach(item => {
+    if (item.siteId) {
+      const exists = state.data.placements.find(p =>
+        p.itemId === item.id && p.siteId === item.siteId && (p.locationId || null) === (item.locationId || null)
+      );
+      if (!exists) {
+        state.data.placements.push({
+          id: uid(),
+          itemId: item.id,
+          siteId: item.siteId,
+          locationId: item.locationId || null,
+          quantity: (item.quantity != null && !isNaN(item.quantity)) ? Number(item.quantity) : 0,
+          createdAt: item.createdAt || Date.now(),
+          createdBy:  item.createdBy || 'system',
+          lastModifiedAt: Date.now(),
+          lastModifiedBy: 'system'
+        });
+        migrated++;
+      }
+      delete item.siteId;
+      delete item.locationId;
+    }
+    if (item.quantity !== undefined) { delete item.quantity; strippedLegacyQty = true; }
+  });
+  if (migrated > 0) {
+    await saveType('items');
+    await saveType('placements');
+  } else if (strippedLegacyQty) {
+    // We stripped legacy quantity fields with no associated site — persist cleanup.
+    await saveType('items');
+  }
+
+  // Migration: backfill `parentId: null` on category records that predate
+  // subcategory support. Without this, the field would be `undefined` on
+  // legacy records and downstream code (filter, accordion, validation) can't
+  // distinguish "explicitly top-level" from "unset". Persist once if needed.
+  let backfilledParent = false;
+  state.data.categories.forEach(c => {
+    if (!('parentId' in c)) { c.parentId = null; backfilledParent = true; }
+  });
+  if (backfilledParent) await saveType('categories');
+
+  setStatus('READY');
+
+  // Auto-connect to cloud if configured + enabled. Runs after the local
+  // state is fully loaded so the user sees their cached data immediately;
+  // cloud connection is non-blocking and surfaces via the topbar pill.
+  // Once connected, any newer data on the server will arrive via realtime
+  // subscriptions OR get fetched on the next read.
+  if (CLOUD.url && CLOUD.anonKey && CLOUD.enabled) {
+    connectCloud().catch(e => {
+      // Non-fatal — user has local data and can re-try from Settings
+      console.error('[cloud sync] auto-connect failed:', e);
+    });
+  } else {
+    refreshCloudStatusPill();
+  }
+}
+async function saveType(type) {
+  const key = KEYS[type];
+  const value = type === 'audit' ? state.audit
+              : type === 'actionLog' ? state.actionLog
+              : state.data[type];
+  try { await window.storage.set(key, JSON.stringify(value), SHARED); setStatus('SAVED ' + new Date().toLocaleTimeString()); }
+  catch(e) { setStatus('SAVE FAILED'); toast('Save failed: ' + e.message, 'error'); }
+}
+async function saveAudit() { if (state.audit.length > 1000) state.audit = state.audit.slice(-1000); await saveType('audit'); }
+async function saveActionLog() { if (state.actionLog.length > 2000) state.actionLog = state.actionLog.slice(-2000); await saveType('actionLog'); }
+function setStatus(s){ const el = document.getElementById('storageStatus'); if (el) el.textContent = '// ' + s; }
+
+/* ---------- THEME ----------
+   Four themes, all driven by CSS variables on body.<name>-mode. Adding
+   a new theme is: (1) define a body.<name>-mode block in the stylesheet,
+   (2) add an entry below with display metadata and preview swatch colors,
+   (3) include the name in VALID_THEME_NAMES. The preview swatch values
+   are duplicated here on purpose so the Theme picker renders accurate
+   thumbnails before the user commits to the switch. */
+const THEMES = [
+  { name: 'dark',     label: 'Dark',     desc: 'Terminal · cyber',     preview: { bg:'#0e1014', surface:'#1f2330', text:'#e8eaed', amber:'#ffb000' } },
+  { name: 'midnight', label: 'Midnight', desc: 'Deep navy · calm',     preview: { bg:'#0a1428', surface:'#1a2a4a', text:'#e2e8f3', amber:'#ffb000' } },
+  { name: 'slate',    label: 'Slate',    desc: 'Steel · neutral',      preview: { bg:'#1a1d24', surface:'#2f343f', text:'#e0e3e8', amber:'#ffb000' } },
+  { name: 'ember',    label: 'Ember',    desc: 'Warm · glow',          preview: { bg:'#1a1410', surface:'#2c2218', text:'#f0e8dc', amber:'#ffb000' } },
+  { name: 'light',    label: 'Light',    desc: 'Industrial · paper',   preview: { bg:'#ebe7d8', surface:'#fcfaf2', text:'#1a180f', amber:'#b56b00' } },
+  { name: 'sepia',    label: 'Sepia',    desc: 'Warm cream · daytime', preview: { bg:'#f4ead0', surface:'#fefae9', text:'#1f1a0d', amber:'#a55a00' } },
+  { name: 'arctic',   label: 'Arctic',   desc: 'Frost · crisp',        preview: { bg:'#e8edf2', surface:'#fbfcfd', text:'#11161e', amber:'#b56b00' } },
+  { name: 'snow',     label: 'Snow',     desc: 'Pure · daylight',      preview: { bg:'#f4f4f5', surface:'#ffffff', text:'#18181b', amber:'#b56b00' } }
+];
+const VALID_THEME_NAMES = THEMES.map(t => t.name);
+
+/* applyTheme writes the right body class for state.theme. Called once on load
+   and again on every change. Pure DOM mutation — no re-render needed because
+   every theme-sensitive style is driven by CSS variables. */
+function applyTheme() {
+  // Remove any previous theme class. Iterating the catalog (rather than a
+  // hard-coded ['dark-mode','light-mode']) means new themes added to THEMES
+  // automatically get cleaned up here too.
+  VALID_THEME_NAMES.forEach(n => document.body.classList.remove(n + '-mode'));
+  document.body.classList.add(state.theme + '-mode');
+}
+async function setTheme(name) {
+  if (!VALID_THEME_NAMES.includes(name)) return;
+  if (state.theme === name) return;
+  state.theme = name;
+  applyTheme();
+  // Persist directly (theme isn't in state.data, so saveType doesn't apply).
+  try { await window.storage.set(KEYS.theme, JSON.stringify(state.theme), SHARED); }
+  catch(e) { /* non-fatal — change still works for the session */ }
+  // If the Theme settings view is open, re-render so the "active" card
+  // visually updates.
+  if (state.activeTab === 'settings' && state.settingsView === 'theme') render();
+}
+
+/* ---------- LOGO ----------
+   Custom brand-mark PNG, scoped tightly: only the "Jake Hardin" profile
+   can change it (see isLogoAdmin), everyone sees the result. Stored as a
+   base64 data URL via the same cloud-mirrored window.storage as theme,
+   so updates propagate to other signed-in devices through the existing
+   realtime subscription. */
+
+/* Permission gate. Matched on the signed-in user's full name, case-
+   insensitive and trimmed. Honest caveat: if Jake's user record is ever
+   renamed, this gate breaks; if a second user is also named Jake Hardin
+   they'd also pass. Swap to an id-based check by editing this one
+   function if either becomes a problem. */
+function isLogoAdmin() {
+  if (!state.user) return false;
+  const fullName = ((state.user.firstName || '') + ' ' + (state.user.lastName || '')).trim().toLowerCase();
+  return fullName === 'jake hardin';
+}
+
+/* applyLogo mutates every .brand-mark and .signin-mark element in the
+   DOM in place. With a custom logo set, it adds the .custom-logo class
+   (CSS strips the amber chevron) and renders an <img>. Without one, it
+   restores the default "P&S" text. Pure DOM — safe to call from any
+   code path.
+
+   v53: switched from querySelector to querySelectorAll. Only the topbar
+   has a brand-mark in normal navigation, but when the user is on the
+   Logo settings page there's a second .brand-mark for the live preview.
+   Updating both at once keeps them strictly in sync, and also future-
+   proofs against any new screen that wants its own brand-mark preview
+   (sign-in card, splash, etc.).
+
+   v58: widened to also include .signin-mark. With the helper signinMarkHTML
+   baking the right initial markup at render time, this gives us belt-and-
+   suspenders coverage for the case where a cross-device logo change
+   arrives while the user is sitting on the sign-in screen.
+
+   Also called from applyViewMode so a web↔mobile toggle re-applies the
+   custom-logo class to the brand-mark — defensive, in case anything in
+   the layout switch ever dropped the class. */
+function applyLogo() {
+  const els = document.querySelectorAll('.brand-mark, .signin-mark');
+  if (els.length === 0) return;
+  const hasCustom = state.logo && typeof state.logo === 'string' && state.logo.startsWith('data:image/png;base64,');
+  els.forEach(el => {
+    if (hasCustom) {
+      el.classList.add('custom-logo');
+      // Use Image element + src assignment rather than innerHTML interpolation
+      // — defense in depth, since state.logo originates as user-uploaded bytes.
+      el.textContent = '';
+      const img = document.createElement('img');
+      img.src = state.logo;
+      img.alt = 'Brand logo';
+      el.appendChild(img);
+    } else {
+      el.classList.remove('custom-logo');
+      el.textContent = '';
+      // Restore the original "P&S" text node. The amber + clip-path styling
+      // comes back automatically once .custom-logo is removed.
+      el.appendChild(document.createTextNode('P&S'));
+    }
+  });
+}
+
+/* v58: HTML for the sign-in screen's brand mark, used by renderSignIn()'s
+   bootstrap / password-prompt / user-picker paths. Bakes the current
+   state.logo into the initial markup so a fresh sign-in render shows
+   the custom logo immediately — no flash of default P&S before applyLogo
+   would otherwise overwrite it. */
+function signinMarkHTML() {
+  if (state.logo && typeof state.logo === 'string' && state.logo.startsWith('data:image/png;base64,')) {
+    return `<div class="signin-mark custom-logo"><img src="${escapeHtml(state.logo)}" alt="Brand logo"></div>`;
+  }
+  return `<div class="signin-mark">P&amp;S</div>`;
+}
+
+async function setLogo(dataUrl) {
+  // Permission re-check at the data layer (the menu item is hidden for
+  // non-Jake users, but never trust the UI alone).
+  if (!isLogoAdmin()) { toast('Only the Jake Hardin profile can change the logo.', 'error'); return; }
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png;base64,')) {
+    toast('Logo must be a PNG.', 'error');
+    return;
+  }
+  state.logo = dataUrl;
+  applyLogo();
+  try { await window.storage.set(KEYS.logo, JSON.stringify(state.logo), SHARED); }
+  catch (e) { /* non-fatal — change still works for the session */ }
+  if (state.activeTab === 'settings' && state.settingsView === 'logo') render();
+}
+
+async function clearLogo() {
+  if (!isLogoAdmin()) { toast('Only the Jake Hardin profile can change the logo.', 'error'); return; }
+  state.logo = null;
+  applyLogo();
+  try { await window.storage.set(KEYS.logo, JSON.stringify(null), SHARED); }
+  catch (e) { /* non-fatal */ }
+  if (state.activeTab === 'settings' && state.settingsView === 'logo') render();
+}
+
+/* Hard cap on uploaded PNG size. Raw file bytes — base64 expansion is
+   ~33% on top of this. Keeping the limit tight protects cloud sync
+   round-trips (the whole value rides on every realtime broadcast and
+   every full push). 1 MB is generous for a UI brand mark. */
+const LOGO_MAX_BYTES = 1024 * 1024;
+
+/* Handler wired from the file input in renderLogoView. Reads the chosen
+   PNG, validates, base64-encodes via FileReader, and persists. Surfaces
+   inline status into #logoUploadStatus so the user gets feedback even
+   when the upload fails. */
+function handleLogoFileChange(input) {
+  const statusEl = document.getElementById('logoUploadStatus');
+  const setStatus = (msg, kind) => {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.style.color = kind === 'error' ? 'var(--danger, #ff6b6b)'
+                          : kind === 'ok'    ? 'var(--ok, #5cb85c)'
+                          : 'var(--text-dim)';
+  };
+  if (!isLogoAdmin()) { setStatus('Only the Jake Hardin profile can change the logo.', 'error'); input.value = ''; return; }
+  const file = input.files && input.files[0];
+  if (!file) { setStatus('', null); return; }
+  if (file.type !== 'image/png') {
+    setStatus(`File must be PNG (got "${file.type || 'unknown'}").`, 'error');
+    input.value = '';
+    return;
+  }
+  if (file.size > LOGO_MAX_BYTES) {
+    setStatus(`PNG is ${(file.size / 1024).toFixed(0)} KB — limit is ${Math.round(LOGO_MAX_BYTES / 1024)} KB. Try a smaller export.`, 'error');
+    input.value = '';
+    return;
+  }
+  setStatus('Reading PNG…', null);
+  const reader = new FileReader();
+  reader.onerror = () => setStatus('Failed to read file.', 'error');
+  reader.onload = async () => {
+    const dataUrl = reader.result;
+    if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png;base64,')) {
+      setStatus('Unexpected file contents — make sure it\'s a real PNG.', 'error');
+      return;
+    }
+    await setLogo(dataUrl);
+    setStatus(`Logo updated · ${(file.size / 1024).toFixed(1)} KB · syncing to other devices…`, 'ok');
+  };
+  reader.readAsDataURL(file);
+}
+
+function goLogo() {
+  state.activeTab = 'settings';
+  state.settingsView = 'logo';
+  closeSettingsMenu();
+  document.querySelectorAll('#primaryTabs [data-tab]').forEach(b => b.classList.remove('active'));
+  render();
+}
+
+/* ---------- VIEW MODE (web / mobile) ----------
+   Explicit user toggle that forces mobile layout regardless of viewport
+   size. The existing responsive media queries (@media max-width: ...)
+   still handle actual narrow screens automatically; this toggle is an
+   ADDITIONAL override. body.mobile-view triggers a bundle of cascade
+   overrides in the stylesheet. */
+/* v66: three view modes now —
+     · web    → full desktop UI (sidebar, multi-tab nav, dense tables)
+     · mobile → touch-tightened version of the same web layout
+     · simple → minimal kiosk-style UI with only ACTIONS and ITEM SEARCH
+
+   applyViewMode swaps the right body class so CSS can target the active
+   mode. The toggle button in the topbar (if it exists) still only flips
+   between web ↔ mobile — to enter Simple, the user goes through the
+   View Mode settings page (which picks any of the three). */
+function applyViewMode() {
+  document.body.classList.remove('web-mode', 'mobile-view', 'simple-view');
+  if (state.viewMode === 'mobile') {
+    document.body.classList.add('mobile-view');
+  } else if (state.viewMode === 'simple') {
+    // v67: simple mode inherits ALL the mobile-view CSS (topbar grid,
+    // touch sizing, working-site button styling, hamburger hidden,
+    // etc.) by carrying both classes. The simple-view-specific rules
+    // (hide sidebar, swap in the 2-tab bar, card grid) layer on top.
+    // Without this the topbar fell back to web-style layout — which
+    // didn't fit the simple mode's mobile-first intent.
+    document.body.classList.add('mobile-view');
+    document.body.classList.add('simple-view');
+  } else {
+    document.body.classList.add('web-mode');
+  }
+  // Sync the toggle's visual state if it's already on the page (which it
+  // is once the topbar is rendered).
+  const tg = document.getElementById('viewModeToggle');
+  if (tg) tg.classList.toggle('on', state.viewMode === 'mobile');
+  // v53: re-apply the custom logo (if any) after the mode swap. The brand-
+  // mark element is the same in all modes and should retain its custom-
+  // logo class through any reasonable layout change — but calling applyLogo
+  // here makes it a guarantee. Cheap (just a DOM read + a few writes) and
+  // bulletproofs the mode transition against any future regression that
+  // might otherwise drop the logo styling.
+  applyLogo();
+}
+
+/* v66: setViewMode replaces toggleViewMode for the 3-state world. The
+   View Mode settings page calls this with 'web' | 'mobile' | 'simple'.
+   toggleViewMode is kept as a backward-compat shim for any code path
+   that still flips binary (the topbar's old toggle button, etc.) — it
+   only swaps web ↔ mobile; the only way into Simple is via setViewMode
+   from the settings UI. */
+async function setViewMode(mode) {
+  if (mode !== 'web' && mode !== 'mobile' && mode !== 'simple') return;
+  if (state.viewMode === mode) return;
+  state.viewMode = mode;
+  applyViewMode();
+  saveViewMode();
+  // Entering Simple → default to ACTIONS unless the user is already on
+  // a simple-friendly tab (settings is OK; items-list isn't, etc.).
+  if (mode === 'simple' && state.activeTab !== 'settings') {
+    state.activeTab = 'actions';
+    state.activeSimpleTab = state.activeSimpleTab || 'actions';
+  }
+  // Leaving Simple → if active tab was 'itemSearch' (a simple-only tab),
+  // route to a sensible web/mobile equivalent (items list).
+  if (mode !== 'simple' && state.activeTab === 'itemSearch') {
+    state.activeTab = 'items';
+  }
+  render();
+}
+
+async function toggleViewMode() {
+  // Binary toggle — used by any pre-v66 code path / UI affordance.
+  // Cycles web ↔ mobile only. Use setViewMode for Simple.
+  const next = state.viewMode === 'mobile' ? 'web' : 'mobile';
+  await setViewMode(next);
+  // Used to: re-render Settings if open. setViewMode already calls
+  // render() so this is handled.
+}
+
+/* ---------- ITEMS COLUMN PREFS ----------
+   Persisted user customization of the All Items list:
+     · which columns are visible (state.itemsColumnPrefs.hidden)
+     · what order they appear in (state.itemsColumnPrefs.order)
+
+   Both are keyed by the stable `key` field on each LIST_COLS.items entry.
+   This survives renames of the user-visible `label` and reordering of the
+   LIST_COLS array source itself — only deleting a column from LIST_COLS
+   (and its key from this file) invalidates a stored entry, and reconcile
+   below silently drops invalidated keys.
+
+   The leading selection checkbox column and the trailing lastModified +
+   actions cells are NOT in this system — they're structural fixtures. */
+
+const DEFAULT_ITEMS_COL_ORDER = LIST_COLS.items.map(c => c.key);
+
+/* v55 (Request 3): mobile users want a much tighter default — three
+   columns visible (Item #, Name, List $), everything else hidden but
+   still available via the COLUMNS popover. The user can toggle more
+   on; their custom selection is persisted under KEYS.itemsColumnsMobile
+   independently from the web view's prefs. */
+const DEFAULT_MOBILE_ITEMS_VISIBLE_KEYS = new Set(['itemNumber', 'name', 'listPrice']);
+
+function defaultItemsColumnPrefs(mode) {
+  if (mode === 'mobile') {
+    return {
+      order: DEFAULT_ITEMS_COL_ORDER.slice(),
+      // Hidden = everything EXCEPT the three mobile defaults. If LIST_COLS.items
+      // ever drops or renames a key, reconcileItemsColumnPrefs cleans up the
+      // hidden list against the current schema so no stale keys linger.
+      hidden: DEFAULT_ITEMS_COL_ORDER.filter(k => !DEFAULT_MOBILE_ITEMS_VISIBLE_KEYS.has(k))
+    };
+  }
+  return { order: DEFAULT_ITEMS_COL_ORDER.slice(), hidden: [] };
+}
+
+/* Returns whichever prefs object is active for the current view mode.
+   The columns popover reads/writes through this helper so the same UI
+   transparently controls both prefs without branching at every call site. */
+function activeItemsColumnPrefs() {
+  return state.viewMode === 'mobile' ? state.itemsColumnPrefsMobile : state.itemsColumnPrefs;
+}
+function activeItemsColumnsKey() {
+  return state.viewMode === 'mobile' ? KEYS.itemsColumnsMobile : KEYS.itemsColumns;
+}
+
+/* Reconcile stored prefs against the current LIST_COLS schema. Called once
+   on load (after the persisted value has been read into state) and again
+   whenever we receive a stored value that may be stale. Self-healing for
+   BOTH web and mobile prefs:
+     · ORDER entries that no longer exist are dropped
+     · ORDER missing any current key is patched (the missing key is appended)
+     · HIDDEN entries that no longer exist are dropped
+     · Mobile prefs default to the 3-column mobile starter when empty */
+function reconcileItemsColumnPrefs() {
+  const validKeys = new Set(LIST_COLS.items.map(c => c.key));
+  for (const [prefs, mode] of [
+    [state.itemsColumnPrefs,       'web'],
+    [state.itemsColumnPrefsMobile, 'mobile']
+  ]) {
+    // Empty pref → use the mode-appropriate default. Otherwise sanitize.
+    if (!prefs.order || prefs.order.length === 0) {
+      const def = defaultItemsColumnPrefs(mode);
+      prefs.order = def.order;
+      prefs.hidden = def.hidden;
+      continue;
+    }
+    const order = prefs.order.filter(k => validKeys.has(k));
+    const orderSet = new Set(order);
+    for (const c of LIST_COLS.items) if (!orderSet.has(c.key)) order.push(c.key);
+    const hidden = (prefs.hidden || []).filter(k => validKeys.has(k));
+    prefs.order = order;
+    prefs.hidden = hidden;
+  }
+}
+
+/* Returns the effective ordered list of visible items columns. This is
+   what renderListTableInner walks for the items list. Defensive: if
+   prefs got into a bad state somehow, falls back to the default order. */
+function effectiveItemsCols() {
+  const prefs = activeItemsColumnPrefs();
+  const byKey = new Map(LIST_COLS.items.map(c => [c.key, c]));
+  const hidden = new Set(prefs.hidden);
+  const out = [];
+  for (const k of prefs.order) {
+    if (hidden.has(k)) continue;
+    const c = byKey.get(k);
+    if (c) out.push(c);
+  }
+  return out.length > 0 ? out : LIST_COLS.items.slice();
+}
+
+async function saveItemsColumnPrefs() {
+  try {
+    await window.storage.set(activeItemsColumnsKey(), JSON.stringify(activeItemsColumnPrefs()), SHARED);
+  } catch (e) { /* non-fatal — change still works for the session */ }
+}
+
+async function toggleItemsColumnVisibility(key) {
+  if (!LIST_COLS.items.find(c => c.key === key)) return;
+  // v60 (Request 2): Item # is pinned on mobile — it's the row's edit
+  // affordance (per v57: clicking the id-tag opens the edit form), so
+  // hiding it would strand mobile users with no way to edit. The popover
+  // also disables the checkbox so this branch is mostly belt-and-suspenders.
+  if (state.viewMode === 'mobile' && key === 'number') {
+    toast('Item # column is required on mobile', 'error');
+    return;
+  }
+  const prefs = activeItemsColumnPrefs();
+  const hidden = new Set(prefs.hidden);
+  // Refuse to hide the last visible column — leaves the table headless
+  // and confuses the user about why their data disappeared. The popover
+  // also disables the corresponding checkbox to make this clear.
+  if (!hidden.has(key) && (LIST_COLS.items.length - hidden.size - 1) === 0) {
+    toast('At least one column must remain visible', 'error');
+    return;
+  }
+  if (hidden.has(key)) hidden.delete(key); else hidden.add(key);
+  prefs.hidden = [...hidden];
+  await saveItemsColumnPrefs();
+  refreshListTable('items');
+  refreshColumnsPanel();
+}
+
+async function reorderItemsColumn(fromKey, toKey, position) {
+  // position: 'before' | 'after' — where to drop fromKey relative to toKey
+  if (fromKey === toKey) return;
+  const prefs = activeItemsColumnPrefs();
+  const order = prefs.order.slice();
+  const fromIdx = order.indexOf(fromKey);
+  if (fromIdx === -1) return;
+  order.splice(fromIdx, 1);
+  const toIdx = order.indexOf(toKey);
+  if (toIdx === -1) { order.push(fromKey); }
+  else order.splice(position === 'after' ? toIdx + 1 : toIdx, 0, fromKey);
+  prefs.order = order;
+  await saveItemsColumnPrefs();
+  refreshListTable('items');
+  refreshColumnsPanel();
+}
+
+async function resetItemsColumnPrefs() {
+  const defaults = defaultItemsColumnPrefs(state.viewMode);
+  if (state.viewMode === 'mobile') {
+    state.itemsColumnPrefsMobile = defaults;
+  } else {
+    state.itemsColumnPrefs = defaults;
+  }
+  await saveItemsColumnPrefs();
+  refreshListTable('items');
+  refreshColumnsPanel();
+}
+
+/* ---------- CATEGORY ITEMS COLUMN PREFS (v49) ----------
+   Parallel of the items-column-prefs machinery for the per-category
+   item tables on the Categories tab. Same shape, same persistence
+   pattern, different LIST_COLS source + storage key + refresh hook.
+   Kept as separate functions rather than threading a domain parameter
+   through the existing items-column code because the change set in
+   v49 was already large; this keeps the new code isolated and the
+   existing items list untouched. */
+
+const DEFAULT_CATEGORY_ITEMS_COL_ORDER = LIST_COLS.categoryItems.map(c => c.key);
+
+function reconcileCategoryItemsColumnPrefs() {
+  const validKeys = new Set(LIST_COLS.categoryItems.map(c => c.key));
+  const order = (state.categoryItemsColumnPrefs.order || []).filter(k => validKeys.has(k));
+  const orderSet = new Set(order);
+  for (const c of LIST_COLS.categoryItems) if (!orderSet.has(c.key)) order.push(c.key);
+  const hidden = (state.categoryItemsColumnPrefs.hidden || []).filter(k => validKeys.has(k));
+  state.categoryItemsColumnPrefs = { order, hidden };
+}
+
+function effectiveCategoryItemsCols() {
+  const byKey = new Map(LIST_COLS.categoryItems.map(c => [c.key, c]));
+  const hidden = new Set(state.categoryItemsColumnPrefs.hidden);
+  const out = [];
+  for (const k of state.categoryItemsColumnPrefs.order) {
+    if (hidden.has(k)) continue;
+    const c = byKey.get(k);
+    if (c) out.push(c);
+  }
+  return out.length > 0 ? out : LIST_COLS.categoryItems.slice();
+}
+
+async function saveCategoryItemsColumnPrefs() {
+  try {
+    await window.storage.set(KEYS.categoryItemsColumns, JSON.stringify(state.categoryItemsColumnPrefs), SHARED);
+  } catch (e) { /* non-fatal */ }
+}
+
+async function toggleCategoryItemsColumnVisibility(key) {
+  if (!LIST_COLS.categoryItems.find(c => c.key === key)) return;
+  // v60 (Request 2): on mobile, the Item # column is the only way to
+  // edit an item from the Categories tab (clicking the id-tag opens the
+  // edit form per v57). Hiding it would strand the user. The popover
+  // disables this checkbox so this branch is defensive.
+  if (state.viewMode === 'mobile' && key === 'itemNumber') {
+    toast('Item # column is required on mobile', 'error');
+    return;
+  }
+  const hidden = new Set(state.categoryItemsColumnPrefs.hidden);
+  if (!hidden.has(key) && (LIST_COLS.categoryItems.length - hidden.size - 1) === 0) {
+    toast('At least one column must remain visible', 'error');
+    return;
+  }
+  if (hidden.has(key)) hidden.delete(key); else hidden.add(key);
+  state.categoryItemsColumnPrefs.hidden = [...hidden];
+  await saveCategoryItemsColumnPrefs();
+  // Full re-render — the columns affect every per-category table on the
+  // page, and we don't have a single "table id" to refresh in place the
+  // way refreshListTable does for items.
+  const wasOpen = state.columnsPanelOpen && state.columnsDomain === 'categoryItems';
+  render();
+  if (wasOpen) {
+    state.columnsPanelOpen = true;
+    state.columnsDomain = 'categoryItems';
+    refreshCategoryItemsColumnsPanel();
+  }
+}
+
+async function reorderCategoryItemsColumn(fromKey, toKey, position) {
+  if (fromKey === toKey) return;
+  const order = state.categoryItemsColumnPrefs.order.slice();
+  const fromIdx = order.indexOf(fromKey);
+  if (fromIdx === -1) return;
+  order.splice(fromIdx, 1);
+  const toIdx = order.indexOf(toKey);
+  if (toIdx === -1) { order.push(fromKey); }
+  else order.splice(position === 'after' ? toIdx + 1 : toIdx, 0, fromKey);
+  state.categoryItemsColumnPrefs.order = order;
+  await saveCategoryItemsColumnPrefs();
+  const wasOpen = state.columnsPanelOpen && state.columnsDomain === 'categoryItems';
+  render();
+  if (wasOpen) {
+    state.columnsPanelOpen = true;
+    state.columnsDomain = 'categoryItems';
+    refreshCategoryItemsColumnsPanel();
+  }
+}
+
+async function resetCategoryItemsColumnPrefs() {
+  state.categoryItemsColumnPrefs = { order: DEFAULT_CATEGORY_ITEMS_COL_ORDER.slice(), hidden: [] };
+  await saveCategoryItemsColumnPrefs();
+  const wasOpen = state.columnsPanelOpen && state.columnsDomain === 'categoryItems';
+  render();
+  if (wasOpen) {
+    state.columnsPanelOpen = true;
+    state.columnsDomain = 'categoryItems';
+    refreshCategoryItemsColumnsPanel();
+  }
+}
+
+/* ---------- HELPERS ---------- */
+function uid(){ return 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
+const fmt$ = n => n == null || n === '' ? '—' : '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const escapeHtml = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtDate = ts => { const d = new Date(ts); return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); };
+
+/* ---------- STOCK LEVEL HELPERS ----------
+   "Total quantity" for an item is the sum of its placements' quantities;
+   "low stock" is when an item has a numeric minStock threshold AND that
+   threshold is currently being underrun. Items without a minStock value
+   never trigger an alert — the field is opt-in per item. */
+function totalQtyForItem(itemId) {
+  let s = 0;
+  for (const p of state.data.placements) if (p.itemId === itemId) s += Number(p.quantity) || 0;
+  return s;
+}
+/* Same as totalQtyForItem but restricted to placements at a specific site.
+   When siteId is null/undefined this falls back to the global total, so the
+   same call can be used in filtered and unfiltered code paths without an
+   if-branch at every call site. */
+function totalQtyForItemAtSite(itemId, siteId) {
+  if (!siteId) return totalQtyForItem(itemId);
+  let s = 0;
+  for (const p of state.data.placements) {
+    if (p.itemId !== itemId || p.siteId !== siteId) continue;
+    s += Number(p.quantity) || 0;
+  }
+  return s;
+}
+function isLowStock(item) {
+  if (item == null || item.minStock == null || item.minStock === '') return false;
+  const min = Number(item.minStock);
+  if (isNaN(min) || min <= 0) return false;  // 0 / negative / non-numeric → no alert
+  return totalQtyForItem(item.id) < min;
+}
+/* Tri-state stock classification used by the Status column on the items
+   list. Separate from isLowStock (which is binary: "below min or not")
+   because the column draws three distinct states and the existing low-
+   stock alerts elsewhere still want the binary view.
+     · out-of-stock — total qty is zero (regardless of minStock)
+     · low-stock    — qty > 0 AND minStock > 0 AND qty < minStock
+     · in-stock     — everything else (qty > 0 AND either no minStock or qty ≥ minStock)
+   The Out-of-Stock case takes precedence over Low Stock so an item with
+   qty=0 and minStock=10 reads as "out", not "low". */
+function stockStatus(item) {
+  const qty = totalQtyForItem(item.id);
+  if (qty <= 0) return 'out-of-stock';
+  const min = Number(item.minStock);
+  if (item.minStock != null && item.minStock !== '' && !isNaN(min) && min > 0 && qty < min) {
+    return 'low-stock';
+  }
+  return 'in-stock';
+}
+const STOCK_STATUS_LABEL = {
+  'in-stock': 'In Stock',
+  'low-stock': 'Low Stock',
+  'out-of-stock': 'Out of Stock'
+};
+/* Returns low-stock items decorated with their current qty and shortage,
+   sorted by largest shortage first (most critical at the top).
+
+   v59 (Request 1): now accepts an optional scopeIds Set. When provided
+   and non-empty, qty is summed only across placements at those sites —
+   so the Low Stock card on the Dashboard surfaces items running low IN
+   THE USER'S SELECTED WORKING SITES rather than globally. The minStock
+   threshold is still a per-item property (no per-site minimum exists);
+   when scope is set, that threshold is interpreted as "minimum across
+   the working sites". Empty / undefined scopeIds = unchanged global
+   behavior, keeping the function backwards compatible with any other
+   caller that doesn't pass scope. */
+function lowStockItems(scopeIds) {
+  const useScope = scopeIds && scopeIds.size > 0;
+  // v63: only items with at least one placement at a scoped site are
+  // this scope's concern. Without this gate, an item that exists only
+  // at OTHER sites would have qty-in-scope = 0, which is below any
+  // minStock threshold, so the card would surface it as "low" — but
+  // it isn't the working-site's stock to worry about. Pre-computing
+  // the in-scope item set once is cheaper than walking placements per
+  // item inside the loop.
+  let itemIdsInScope = null;
+  if (useScope) {
+    itemIdsInScope = new Set();
+    for (const p of state.data.placements) {
+      if (scopeIds.has(p.siteId)) itemIdsInScope.add(p.itemId);
+    }
+  }
+  const out = [];
+  for (const i of state.data.items) {
+    if (i.minStock == null || i.minStock === '') continue;
+    const min = Number(i.minStock);
+    if (isNaN(min) || min <= 0) continue;
+    // Scope gate: item must have at least one placement in scope, else
+    // it's not a watched item from this working-site's perspective.
+    if (useScope && !itemIdsInScope.has(i.id)) continue;
+    const qty = useScope
+      ? totalQtyForItemInScope(i.id, scopeIds)
+      : totalQtyForItem(i.id);
+    if (qty >= min) continue;
+    out.push({ item: i, qty, min, shortage: min - qty });
+  }
+  out.sort((a, b) => b.shortage - a.shortage);
+  return out;
+}
+
+/* ---------- CATEGORY HIERARCHY HELPERS ----------
+   Categories are a single self-referential entity: a category with a non-null
+   parentId is a sub-category. Depth is capped at 2 levels (validation refuses
+   to set parentId on a category that already has children). These helpers are
+   the single source of truth for path-style names, children lookups, and
+   "category + descendants" id resolution used by the items category filter. */
+function categoryPathName(categoryId) {
+  if (!categoryId) return null;
+  const c = state.data.categories.find(x => x.id === categoryId);
+  if (!c) return null;
+  if (!c.parentId) return c.name;
+  const p = state.data.categories.find(x => x.id === c.parentId);
+  return p ? `${p.name} / ${c.name}` : c.name;
+}
+function categoryChildren(categoryId) {
+  if (!categoryId) return [];
+  return state.data.categories.filter(c => c.parentId === categoryId);
+}
+function isTopLevelCategory(category) {
+  return !category.parentId;
+}
+/* Returns the set of category ids matched when filtering by `categoryId`:
+   the id itself plus any direct children. Used so that selecting a parent in
+   the items category filter also pulls in items placed under its subs. */
+function categoryIdAndDescendants(categoryId) {
+  const ids = new Set([categoryId]);
+  state.data.categories.forEach(c => { if (c.parentId === categoryId) ids.add(c.id); });
+  return ids;
+}
+
+/* ---------- TAG HELPERS ----------
+   Tags are an item ⇄ customer association table. Each tag carries a
+   quantity ("this item, allocated to this customer, in this amount").
+   They DO NOT consume stock from placements — they're labels, not
+   inventory movements. Use the Actions tab (Move) for actual stock
+   transfer.
+
+   Invariant: at most ONE tag per (itemId, customerId) pair. Calling
+   upsertTag with an existing pair updates the existing record's qty
+   rather than inserting a duplicate. Deletion of either side cascades
+   the affected tags (see confirmDelete for the warning UX). */
+function tagsForItem(itemId) {
+  return state.data.tags.filter(t => t.itemId === itemId);
+}
+function tagsForCustomer(customerId) {
+  return state.data.tags.filter(t => t.customerId === customerId);
+}
+function findTag(itemId, customerId) {
+  return state.data.tags.find(t => t.itemId === itemId && t.customerId === customerId) || null;
+}
+/* Upsert: if a tag already exists for (itemId, customerId), update its
+   quantity. Otherwise insert a new record. Returns the resulting tag.
+   Persists + logs. */
+async function upsertTag(itemId, customerId, quantity) {
+  const qty = Math.max(0, Math.floor(Number(quantity) || 0));
+  if (!itemId || !customerId || qty <= 0) return null;
+  const existing = findTag(itemId, customerId);
+  const now = Date.now();
+  if (existing) {
+    const before = existing.quantity;
+    existing.quantity = qty;
+    existing.lastModifiedBy = state.user.email;
+    existing.lastModifiedAt = now;
+    await saveType('tags');
+    logAction('TAG_UPDATE', 'tags', _tagLabel(existing), `qty ${before} → ${qty}`);
+    return existing;
+  }
+  const tag = {
+    id: uid(), itemId, customerId, quantity: qty,
+    createdBy: state.user.email, createdAt: now,
+    lastModifiedBy: state.user.email, lastModifiedAt: now
+  };
+  state.data.tags.push(tag);
+  await saveType('tags');
+  logAction('TAG_CREATE', 'tags', _tagLabel(tag), `qty ${qty}`);
+  return tag;
+}
+async function deleteTag(tagId) {
+  const tag = state.data.tags.find(t => t.id === tagId);
+  if (!tag) return;
+  state.data.tags = state.data.tags.filter(t => t.id !== tagId);
+  await saveType('tags');
+  logAction('TAG_DELETE', 'tags', _tagLabel(tag), `qty ${tag.quantity}`);
+}
+function _tagLabel(tag) {
+  const item = state.data.items.find(i => i.id === tag.itemId);
+  const customer = state.data.customers.find(c => c.id === tag.customerId);
+  const itemLabel = item ? (item.itemNumber || item.name || '(deleted item)') : '(deleted item)';
+  const custLabel = customer ? (customer.customerName || '(deleted customer)') : '(deleted customer)';
+  return `${itemLabel} ⇄ ${custLabel}`;
+}
+
+/* ---------- WORKING SITE (global data-scope picker) ----------
+   Replaces the per-page "ALL SITES / LHD WAREHOUSE ONLY" toggles that
+   used to live on Dashboard and Categories. The new model is a global
+   multi-select: state.workingSiteIds is a Set of siteIds, where an empty
+   Set means "all sites" (the unfiltered default) and a non-empty Set
+   narrows Dashboard + Categories to those sites only.
+
+   Persisted per-device via localStorage (NOT through cloud-mirrored
+   window.storage) — different devices can have different working scopes
+   the same way different devices can have different view modes (web vs
+   mobile). The picker UI is reached by the WORKING SITE button in the
+   topbar (left side, after the brand). */
+
+const WORKING_SITES_KEY = 'pns:workingSites'; // localStorage only · per-device
+
+/* v59 (Request 2): viewMode is per-device. Same key string as the old
+   cloud-synced version ('pns:viewMode') so the one-time migration can
+   detect prior settings — see migrateViewModeFromCloud below. */
+const VIEW_MODE_KEY = 'pns:viewMode';   // localStorage only · per-device
+
+function saveViewMode() {
+  try { localStorage.setItem(VIEW_MODE_KEY, JSON.stringify(state.viewMode)); }
+  catch (e) { /* non-fatal — toggle still works for the session */ }
+}
+
+/* Hydrate state.viewMode from localStorage. Returns true if a value was
+   loaded, false if there was nothing to load (caller may then run the
+   one-time cloud migration). Defensive against malformed payloads. */
+function loadViewModeFromStorage() {
+  try {
+    const raw = localStorage.getItem(VIEW_MODE_KEY);
+    if (!raw) return false;
+    const v = JSON.parse(raw);
+    if (v === 'web' || v === 'mobile') {
+      state.viewMode = v;
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+/* One-time migration: if this device has no local viewMode pref AND the
+   cloud still holds the old shared 'pns:viewMode' value (because the
+   user was on a pre-v59 build), copy that cloud value to localStorage
+   so the device starts where the user left off. After this runs, the
+   cloud value is never read again — every toggle is local-only. The
+   migration is idempotent: re-running it after localStorage is set is
+   a no-op. */
+async function migrateViewModeFromCloud() {
+  try {
+    if (localStorage.getItem(VIEW_MODE_KEY)) return; // already local
+    if (typeof ORIG_STORAGE === 'undefined' || !ORIG_STORAGE) return;
+    const r = await ORIG_STORAGE.get('pns:viewMode', SHARED);
+    if (!r || r.value == null) return;
+    const v = JSON.parse(r.value);
+    if (v === 'web' || v === 'mobile') {
+      localStorage.setItem(VIEW_MODE_KEY, JSON.stringify(v));
+      if (state.viewMode !== v) {
+        state.viewMode = v;
+        applyViewMode();
+      }
+    }
+  } catch (e) { /* migration failed; stay with default */ }
+}
+
+/* Save the current selection to localStorage. Stored as a sorted array
+   of siteIds — empty array represents "all sites" (no filter). */
+function saveWorkingSites() {
+  try {
+    const arr = Array.from(state.workingSiteIds);
+    localStorage.setItem(WORKING_SITES_KEY, JSON.stringify(arr));
+  } catch (e) { /* non-fatal — selection still works for the session */ }
+}
+
+/* Hydrate state.workingSiteIds from localStorage. Defensive against
+   malformed JSON, non-array payloads, and entries that aren't strings.
+   Note: dead site references (a saved id that no longer exists in
+   state.data.sites) are NOT pruned here — that happens lazily inside
+   workingSiteSetPruned so we don't have to know whether sites have
+   finished loading at the moment this runs. */
+function loadWorkingSitesFromStorage() {
+  try {
+    const raw = localStorage.getItem(WORKING_SITES_KEY);
+    if (!raw) return;
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) {
+      state.workingSiteIds = new Set(arr.filter(x => typeof x === 'string'));
+    }
+  } catch (e) { /* keep default empty set */ }
+}
+
+/* Returns state.workingSiteIds with any dead references (ids whose site
+   has been deleted) removed. Mutates state.workingSiteIds in place and
+   re-saves if anything was pruned, so the cleanup is sticky. Callers
+   that need the active scope should go through this function so they
+   never have to think about stale ids. */
+function workingSiteSetPruned() {
+  if (state.workingSiteIds.size === 0) return state.workingSiteIds;
+  const validIds = new Set(state.data.sites.map(s => s.id));
+  let changed = false;
+  for (const id of Array.from(state.workingSiteIds)) {
+    if (!validIds.has(id)) { state.workingSiteIds.delete(id); changed = true; }
+  }
+  if (changed) saveWorkingSites();
+  return state.workingSiteIds;
+}
+
+/* True if a working-site scope is in effect (i.e., not "all sites"). */
+function isWorkingSiteFiltered() {
+  return workingSiteSetPruned().size > 0;
+}
+
+/* True if a particular siteId is currently in scope. Returns true for
+   every site when unfiltered, so site-by-site loops can use this without
+   special-casing the "all" mode. */
+function isSiteInWorkingScope(siteId) {
+  const ids = workingSiteSetPruned();
+  return ids.size === 0 || ids.has(siteId);
+}
+
+/* Compact label for the topbar button. Single-site → site name. Multi-
+   site → count. Unfiltered → "ALL SITES". Title attribute on the button
+   carries the full list so hovering still gives detail. */
+function workingSiteLabel() {
+  const ids = workingSiteSetPruned();
+  if (ids.size === 0) return 'ALL SITES';
+  if (ids.size === 1) {
+    const sid = Array.from(ids)[0];
+    const s = state.data.sites.find(x => x.id === sid);
+    return s ? s.name.toUpperCase() : '1 SITE';
+  }
+  return `${ids.size} SITES`;
+}
+
+/* Build the full-list label used for hover/title text. Spells out every
+   selected site name so the user can see exactly what's in scope. */
+function workingSiteTooltip() {
+  const ids = workingSiteSetPruned();
+  if (ids.size === 0) return 'Scope: all sites · click to narrow';
+  const names = state.data.sites
+    .filter(s => ids.has(s.id))
+    .map(s => s.name)
+    .sort((a, b) => a.localeCompare(b));
+  return 'Scope: ' + names.join(', ') + ' · click to change';
+}
+
+/* Update the topbar button's text/title/border in place. Called when the
+   selection changes (apply) and on initial sign-in. Pure DOM mutation
+   — does NOT call render(), so it's safe to invoke from anywhere. */
+function refreshWorkingSiteBtnLabel() {
+  const valEl = document.getElementById('workingSiteBtnValue');
+  if (valEl) valEl.textContent = workingSiteLabel();
+  const btn = document.getElementById('workingSiteBtn');
+  if (btn) {
+    btn.classList.toggle('filtered', isWorkingSiteFiltered());
+    btn.title = workingSiteTooltip();
+  }
+}
+
+/* Count of placements at a site — used in the picker so the user can see
+   how much data each site represents before deciding to include it. */
+function placementCountAtSite(siteId) {
+  let n = 0;
+  for (const p of state.data.placements) if (p.siteId === siteId) n++;
+  return n;
+}
+
+/* ---------- WORKING SITE PICKER (modal) ---------- */
+
+/* Open the picker. We make a draft copy of the current selection so the
+   user can experiment without committing — Apply writes it back, Cancel
+   discards. The draft is also seeded as "all individuals checked" when
+   the current state is the all-sites default, so the user sees the
+   familiar "everything's on" state instead of an empty-looking dialog. */
+function openWorkingSiteModal() {
+  const sites = [...state.data.sites].sort((a, b) => a.name.localeCompare(b.name));
+  if (sites.length === 0) {
+    toast('No sites defined yet — add some under Lookups → Sites.', 'info');
+    return;
+  }
+  const current = workingSiteSetPruned();
+  const draft = current.size === 0
+    ? new Set(sites.map(s => s.id))   // unfiltered → show every box checked
+    : new Set(current);
+  state._workingSiteDraft = draft;
+  renderWorkingSiteModal();
+}
+
+/* Render (or re-render) the modal. Called once on open and again on
+   every checkbox change so the master "All sites" indicator and the
+   footer counter stay in sync. */
+function renderWorkingSiteModal() {
+  const draft = state._workingSiteDraft;
+  if (!draft) return;
+  const sites = [...state.data.sites].sort((a, b) => a.name.localeCompare(b.name));
+  const allChecked = draft.size === sites.length;
+  const noneChecked = draft.size === 0;
+
+  const list = sites.map(s => {
+    const checked = draft.has(s.id);
+    const count = placementCountAtSite(s.id);
+    return `
+      <label class="ws-item${checked ? ' selected' : ''}">
+        <input type="checkbox" ${checked ? 'checked' : ''} onchange="toggleDraftSite('${s.id}')">
+        <span class="ws-item-name">${escapeHtml(s.name)}</span>
+        <span class="ws-item-meta">${count} placement${count === 1 ? '' : 's'}</span>
+      </label>`;
+  }).join('');
+
+  // Footer summary mirrors the apply-time semantic: empty-or-all → "All sites".
+  const summary = (noneChecked || allChecked)
+    ? 'All sites'
+    : `${draft.size} of ${sites.length} sites`;
+
+  document.getElementById('modalHost').innerHTML = `
+    <div class="modal-overlay" onclick="if(event.target===this) closeWorkingSiteModal()">
+      <div class="modal">
+        <div class="modal-head">
+          <div class="modal-title-row">
+            <div class="modal-title">WORKING SITE</div>
+            <div class="modal-sub">// Pick which sites to view across Dashboard + Categories · single, multiple, or all</div>
+          </div>
+          <button class="close-btn" onclick="closeWorkingSiteModal()">×</button>
+        </div>
+        <div class="modal-body">
+          <label class="ws-item ws-all${allChecked ? ' selected' : ''}">
+            <input type="checkbox" ${allChecked ? 'checked' : ''} onchange="toggleDraftAll()">
+            <span class="ws-item-name">▸ ALL SITES</span>
+            <span class="ws-item-meta">${sites.length} total</span>
+          </label>
+          <div class="ws-divider"></div>
+          <div class="ws-list">${list}</div>
+        </div>
+        <div class="modal-foot">
+          <div class="modal-foot-info">// ${escapeHtml(summary)} selected</div>
+          <div class="modal-foot-buttons">
+            <button class="btn ghost" onclick="closeWorkingSiteModal()">CANCEL</button>
+            <button class="btn" onclick="applyWorkingSiteSelection()">APPLY</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+/* Toggle a single site in the draft. Re-renders the modal so the footer
+   counter and master "All" checkbox reflect the change immediately. */
+function toggleDraftSite(siteId) {
+  if (!state._workingSiteDraft) return;
+  if (state._workingSiteDraft.has(siteId)) state._workingSiteDraft.delete(siteId);
+  else state._workingSiteDraft.add(siteId);
+  renderWorkingSiteModal();
+}
+
+/* Master toggle. If everything's checked → clear to empty. Otherwise →
+   fill with all site ids. The apply-time normalization treats "all
+   checked" as identical to "empty" anyway, so this is purely a UX
+   convenience for the picker. */
+function toggleDraftAll() {
+  if (!state._workingSiteDraft) return;
+  const sites = state.data.sites;
+  if (state._workingSiteDraft.size === sites.length) {
+    state._workingSiteDraft = new Set();
+  } else {
+    state._workingSiteDraft = new Set(sites.map(s => s.id));
+  }
+  renderWorkingSiteModal();
+}
+
+/* Commit the draft. Normalization rule: "every individual site checked"
+   collapses to the empty set (= unfiltered "all sites" mode). This way,
+   adding a new site later doesn't quietly stay excluded from a saved
+   scope that the user thought was "everything." Likewise an empty draft
+   collapses to all-sites mode — the alternative ("filter to nothing")
+   would hide all data and is never what the user means. */
+function applyWorkingSiteSelection() {
+  if (!state._workingSiteDraft) return;
+  let draft = state._workingSiteDraft;
+  const allIds = state.data.sites.map(s => s.id);
+  const allChecked = draft.size === allIds.length && allIds.every(id => draft.has(id));
+  if (draft.size === 0 || allChecked) draft = new Set();
+  state.workingSiteIds = draft;
+  state._workingSiteDraft = null;
+  saveWorkingSites();
+  // v50 (Item 2): clear the items-site override so the next Items-tab
+  // render syncs the dropdown to the freshly-chosen working-site set.
+  // Without this, a previous explicit dropdown selection would persist
+  // even after the user changes their working-site upstream.
+  state._itemsSiteUserOverride = false;
+  refreshWorkingSiteBtnLabel();
+  closeWorkingSiteModal();
+  render();
+}
+
+function closeWorkingSiteModal() {
+  state._workingSiteDraft = null;
+  document.getElementById('modalHost').innerHTML = '';
+}
+
+/* Scope-aware totals used by the Categories view. Mirrors
+   totalQtyForItemAtSite / sectionTotals but accepts a Set of siteIds
+   (or empty Set for the "all sites" case). Kept as separate helpers so
+   the single-site versions remain available for any future caller that
+   wants to scope to exactly one site. */
+function totalQtyForItemInScope(itemId, scopeIds) {
+  if (!scopeIds || scopeIds.size === 0) return totalQtyForItem(itemId);
+  let s = 0;
+  for (const p of state.data.placements) {
+    if (p.itemId !== itemId) continue;
+    if (!scopeIds.has(p.siteId)) continue;
+    s += Number(p.quantity) || 0;
+  }
+  return s;
+}
+function sectionTotalsScoped(items, scopeIds) {
+  let totalQty = 0, totalCost = 0;
+  for (const item of items) {
+    const q = totalQtyForItemInScope(item.id, scopeIds);
+    totalQty  += q;
+    totalCost += (Number(item.cost) || 0) * q;
+  }
+  return { totalQty, totalCost };
+}
+
+function toast(msg, kind='info') {
+  const region = document.getElementById('toastRegion');
+  const el = document.createElement('div');
+  el.className = 'toast ' + (kind === 'success' ? 'success' : kind === 'error' ? 'error' : '');
+  el.textContent = msg;
+  region.appendChild(el);
+  setTimeout(() => { el.style.transition='opacity .3s'; el.style.opacity='0'; setTimeout(()=>el.remove(),300); }, 3500);
+}
+
+/* ---------- AUDIT ---------- */
+function logAction(action, entityType, entityLabel, details) {
+  if (!state.user) return;
+  state.audit.push({
+    timestamp: Date.now(),
+    userId: state.user.email,
+    userName: (state.user.firstName + ' ' + state.user.lastName).trim(),
+    userTitle: state.user.title,
+    action, entityType: entityType || null, entityLabel: entityLabel || null, details: details || ''
+  });
+  saveAudit();
+}
+
+/* ---------- VALIDATION ---------- */
+function validateRecord(type, formData, recordId) {
+  const errors = {};
+  ENTITIES[type].fields.forEach(field => {
+    // Password is validated separately in submitForm — the raw value is
+    // never put on formData, so the required-flag check below would always
+    // report a false positive.
+    if (field.type === 'password') return;
+
+    const raw = formData[field.key];
+    const val = raw == null ? '' : (typeof raw === 'string' ? raw.trim() : raw);
+
+    if (field.required) {
+      if (val === '' || val == null) { errors[field.key] = 'This field is required'; return; }
+    }
+    if (!field.required && (val === '' || val == null)) return;
+
+    if (field.type === 'email') {
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val)) { errors[field.key] = 'Enter a valid email'; return; }
+    }
+    if (field.type === 'currency' || field.type === 'number') {
+      const n = parseFloat(val);
+      if (isNaN(n)) { errors[field.key] = 'Enter a valid number'; return; }
+      if (n < 0) { errors[field.key] = 'Must be ≥ 0'; return; }
+    }
+    if (field.type === 'url') {
+      const u = val.includes('://') ? val : 'https://' + val;
+      try { new URL(u); } catch(e) { errors[field.key] = 'Enter a valid URL'; return; }
+    }
+    if (field.unique) {
+      const dup = state.data[type].find(r =>
+        r.id !== recordId &&
+        String(r[field.key] || '').trim().toLowerCase() === String(val).trim().toLowerCase()
+      );
+      if (dup) errors[field.key] = 'Already exists — must be unique';
+    }
+  });
+
+  // Custom: location uniqueness is per-site (same name allowed at different sites)
+  if (type === 'locations' && formData.siteId && formData.name) {
+    const dup = state.data.locations.find(l =>
+      l.id !== recordId &&
+      l.siteId === formData.siteId &&
+      String(l.name || '').trim().toLowerCase() === String(formData.name).trim().toLowerCase()
+    );
+    if (dup && !errors.name) errors.name = 'A location with this name already exists at this site';
+  }
+
+  // Custom: category parentId rules — enforce 2-level depth, no self-reference.
+  // This runs in addition to the per-field required/unique checks above.
+  if (type === 'categories' && formData.parentId) {
+    const pid = formData.parentId;
+    if (pid === recordId) {
+      errors.parentId = 'A category cannot be its own parent';
+    } else {
+      const parent = state.data.categories.find(c => c.id === pid);
+      if (!parent) {
+        errors.parentId = 'Selected parent no longer exists';
+      } else if (parent.parentId) {
+        // Selected parent is itself a sub-category — that would create a 3+
+        // level chain. Refuse.
+        errors.parentId = 'Parent must be a top-level category (no nesting beyond two levels)';
+      } else if (recordId) {
+        // We're editing an existing category. If this category already has
+        // children, attaching it under another parent would orphan its
+        // grandchildren below the depth limit. Refuse.
+        const hasChildren = state.data.categories.some(c => c.parentId === recordId);
+        if (hasChildren) errors.parentId = 'This category has its own sub-categories; remove them before giving it a parent';
+      }
+    }
+  }
+  return errors;
+}
+
+/* ---------- SIGN-IN ---------- */
+
+/* Live-tick timer for the lockout countdown displayed during the password
+   prompt. Module-level so we can cancel it from anywhere we navigate away
+   from the locked prompt — re-render, successful sign-in, back button,
+   sign-out, and so on. */
+let _signinTimer = null;
+function clearSigninTimer() {
+  if (_signinTimer) { clearInterval(_signinTimer); _signinTimer = null; }
+}
+
+function renderSignIn() {
+  clearSigninTimer();
+  const overlay = document.getElementById('signinOverlay');
+  const content = document.getElementById('signinContent');
+  document.getElementById('appShell').style.display = 'none';
+  overlay.style.display = 'grid';
+
+  if (state.data.users.length === 0) {
+    // Bootstrap: create first user (now requires password too)
+    content.innerHTML = `
+      ${signinMarkHTML()}
+      <div class="signin-title">SETUP</div>
+      <div class="signin-sub">// CREATE THE FIRST USER ACCOUNT TO BEGIN</div>
+      <div class="notice">// <strong>FIRST-TIME SETUP</strong> — No users exist yet. Create the first one to start using the system. You can add more team members later under <strong>Manage → Users</strong>.</div>
+      <form id="bootstrapForm" onsubmit="bootstrapFirstUser(event)">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+          <div class="field"><div class="field-label-row"><label>First Name</label><span class="req-badge">REQUIRED</span></div><input name="firstName" class="required-input" required></div>
+          <div class="field"><div class="field-label-row"><label>Last Name</label><span class="req-badge">REQUIRED</span></div><input name="lastName" class="required-input" required></div>
+          <div class="field" style="grid-column:1/-1;"><div class="field-label-row"><label>Email</label><span class="req-badge">REQUIRED</span></div><input type="email" name="email" class="required-input" required placeholder="name@example.com"></div>
+          <div class="field" style="grid-column:1/-1;"><div class="field-label-row"><label>Title</label><span class="req-badge">REQUIRED</span></div><input name="title" class="required-input" required placeholder="e.g. Warehouse Manager"></div>
+          <div class="field"><div class="field-label-row"><label>Password</label><span class="req-badge">REQUIRED</span></div><input type="password" name="password" autocomplete="new-password" class="required-input" required placeholder="at least ${PASSWORD_MIN_LENGTH} characters"></div>
+          <div class="field"><div class="field-label-row"><label>Confirm Password</label><span class="req-badge">REQUIRED</span></div><input type="password" name="passwordConfirm" autocomplete="new-password" class="required-input" required placeholder="re-enter to confirm"></div>
+          <div class="field-help" style="grid-column:1/-1;">// Passwords are hashed and salted with PBKDF2-SHA256 (250,000 iterations). The plaintext is never stored or transmitted.</div>
+        </div>
+        <div class="field-error" id="bootstrapError" style="margin-top:10px;"></div>
+        <button type="submit" class="btn" style="margin-top:18px;">Create &amp; Sign In →</button>
+      </form>`;
+    setTimeout(() => { const f = document.querySelector('#bootstrapForm input'); if (f) f.focus(); }, 50);
+    return;
+  }
+
+  // Password prompt for a specific user (clicked their card)
+  if (state.signinUserId) {
+    const u = state.data.users.find(x => x.id === state.signinUserId);
+    if (!u) { state.signinUserId = null; return renderSignIn(); }
+    const hasPassword = !!u.passwordHash;
+    const lock = hasPassword ? getLockoutStatus(u.id) : { locked: false, secondsRemaining: 0, failedCount: 0 };
+    const isLocked = lock.locked;
+    const disabledAttr = isLocked ? 'disabled' : '';
+
+    content.innerHTML = `
+      ${signinMarkHTML()}
+      <div class="signin-title">${hasPassword ? 'PASSWORD' : 'SET PASSWORD'}</div>
+      <div class="signin-sub">// ${escapeHtml(u.firstName + ' ' + u.lastName)} · ${escapeHtml(u.email)}</div>
+      ${!hasPassword ? `<div class="notice">// <strong>FIRST-TIME PASSWORD</strong> — This account was created before passwords were required. Set one now to continue. Minimum ${PASSWORD_MIN_LENGTH} characters.</div>` : ''}
+      ${isLocked ? `
+        <div class="notice" style="border-color:var(--red);background:rgba(185,28,28,0.05);">
+          // <strong style="color:var(--red);">ACCOUNT LOCKED</strong> — too many failed attempts. Try again in <strong id="lockoutCountdown" style="font-family:'JetBrains Mono',monospace;color:var(--red);">${formatLockoutTime(lock.secondsRemaining)}</strong>.
+        </div>` : ''}
+      <form id="signinForm" onsubmit="${hasPassword ? 'submitSigninPassword(event)' : 'submitSetPassword(event)'}">
+        <div class="field" style="margin-top:18px;">
+          <div class="field-label-row"><label>${hasPassword ? 'Password' : 'New Password'}</label><span class="req-badge">REQUIRED</span></div>
+          <input type="password" name="password" autocomplete="${hasPassword ? 'current-password' : 'new-password'}" class="required-input" required placeholder="${hasPassword ? '' : `at least ${PASSWORD_MIN_LENGTH} characters`}" ${disabledAttr}>
+        </div>
+        ${!hasPassword ? `
+        <div class="field">
+          <div class="field-label-row"><label>Confirm Password</label><span class="req-badge">REQUIRED</span></div>
+          <input type="password" name="passwordConfirm" autocomplete="new-password" class="required-input" required placeholder="re-enter to confirm" ${disabledAttr}>
+        </div>` : ''}
+        <div class="field-error" id="signinError" style="margin-top:10px;min-height:18px;"></div>
+        <div style="display:flex;gap:10px;margin-top:18px;">
+          <button type="submit" class="btn" ${disabledAttr}>${hasPassword ? 'Sign in →' : 'Set password & sign in →'}</button>
+          <button type="button" class="btn ghost" onclick="cancelPasswordPrompt()">← Back</button>
+          ${hasPassword ? `<button type="button" class="btn ghost" style="margin-left:auto;" onclick="forgotPasswordHint()">Forgot password?</button>` : ''}
+        </div>
+      </form>`;
+
+    if (isLocked) {
+      // Live countdown — tick every second, re-render when lock expires.
+      _signinTimer = setInterval(() => {
+        const status = getLockoutStatus(u.id);
+        if (!status.locked) { renderSignIn(); return; }
+        const el = document.getElementById('lockoutCountdown');
+        if (el) el.textContent = formatLockoutTime(status.secondsRemaining);
+      }, 1000);
+    } else {
+      setTimeout(() => { const f = document.querySelector('#signinForm input[name=password]'); if (f) f.focus(); }, 50);
+    }
+    return;
+  }
+
+  // User picker — click a card to enter the password prompt. Lock-state badge
+  // surfaces immediately so users don't waste time typing into a locked card.
+  const users = [...state.data.users].sort((a,b) => (a.firstName + a.lastName).localeCompare(b.firstName + b.lastName));
+  content.innerHTML = `
+    ${signinMarkHTML()}
+    <div class="signin-title">SIGN IN</div>
+    <div class="signin-sub">// SELECT YOUR ACCOUNT TO CONTINUE</div>
+    <div class="user-card-list">
+      ${users.map(u => {
+        const lockState = u.passwordHash ? getLockoutStatus(u.id) : null;
+        const lockBadge = lockState && lockState.locked ? ` · <span style="color:var(--red);">locked ${formatLockoutTime(lockState.secondsRemaining)}</span>` : '';
+        const noPwBadge = !u.passwordHash ? ' · <span style="color:var(--orange);">no password set</span>' : '';
+        return `
+          <div class="user-card" onclick="selectUserForSignin('${u.id}')">
+            <div>
+              <div class="user-card-name">${escapeHtml(u.firstName + ' ' + u.lastName)}</div>
+              <div class="user-card-meta">${escapeHtml(u.title)} · ${escapeHtml(u.email)}${noPwBadge}${lockBadge}</div>
+            </div>
+            <div class="user-card-arrow">→</div>
+          </div>`;
+      }).join('')}
+    </div>
+  `;
+}
+
+function forgotPasswordHint() {
+  const u = state.data.users.find(x => x.id === state.signinUserId);
+  const errEl = document.getElementById('signinError');
+  if (errEl) {
+    errEl.innerHTML = `Ask another signed-in user to reset your password from <strong>Manage → Users → RESET PW</strong>.`;
+  }
+}
+
+function selectUserForSignin(userId) {
+  state.signinUserId = userId;
+  renderSignIn();
+}
+function cancelPasswordPrompt() {
+  state.signinUserId = null;
+  renderSignIn();
+}
+
+async function bootstrapFirstUser(e) {
+  e.preventDefault();
+  const f = e.target;
+  const errEl = document.getElementById('bootstrapError');
+  const setErr = msg => { errEl.textContent = msg; };
+  setErr('');
+  const data = {
+    firstName: f.firstName.value.trim(),
+    lastName:  f.lastName.value.trim(),
+    email:     f.email.value.trim(),
+    title:     f.title.value.trim()
+  };
+  const password        = f.password.value;
+  const passwordConfirm = f.passwordConfirm.value;
+
+  if (!data.firstName || !data.lastName || !data.email || !data.title) { setErr('All fields are required'); return; }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email)) { setErr('Invalid email'); return; }
+  const pwIssue = passwordStrengthIssue(password);
+  if (pwIssue) { setErr(pwIssue); return; }
+  if (password !== passwordConfirm) { setErr('Passwords do not match'); return; }
+
+  const salt = generateSalt();
+  const hash = await hashPassword(password, salt, PASSWORD_ITERATIONS);
+
+  const newUser = {
+    id: uid(), ...data,
+    passwordHash: hash,
+    passwordSalt: salt,
+    passwordIterations: PASSWORD_ITERATIONS,
+    createdAt: Date.now(), lastModifiedAt: Date.now()
+  };
+  state.data.users.push(newUser);
+  await saveType('users');
+  state.user = { id: newUser.id, email: newUser.email, firstName: newUser.firstName, lastName: newUser.lastName, title: newUser.title, profileImage: newUser.profileImage || null };
+  state.signinUserId = null;
+  logAction('USER_CREATE', 'users', newUser.email, 'Bootstrap first user (password set)');
+  logAction('SIGN_IN', null, null, 'First sign-in');
+  enterApp();
+}
+
+async function submitSigninPassword(e) {
+  e.preventDefault();
+  const u = state.data.users.find(x => x.id === state.signinUserId);
+  const errEl = document.getElementById('signinError');
+  errEl.textContent = '';
+  if (!u) { errEl.textContent = 'User no longer exists'; return; }
+
+  // Lockout gate — if locked, refuse to even check the password.
+  const preLock = getLockoutStatus(u.id);
+  if (preLock.locked) {
+    errEl.textContent = `Account is locked. Try again in ${formatLockoutTime(preLock.secondsRemaining)}.`;
+    return;
+  }
+
+  const password = e.target.password.value;
+  if (!password) { errEl.textContent = 'Password is required'; return; }
+  const ok = await verifyPassword(password, u);
+  if (!ok) {
+    const entry = await recordFailedAttempt(u.id);
+    e.target.password.value = '';
+    if (entry.lockUntil && entry.lockUntil > Date.now()) {
+      // Just crossed the threshold — re-render the prompt in locked mode.
+      renderSignIn();
+    } else {
+      errEl.textContent = `Incorrect password · ${LOCKOUT_THRESHOLD - entry.failedCount} attempt${LOCKOUT_THRESHOLD - entry.failedCount === 1 ? '' : 's'} remaining before lockout`;
+      e.target.password.focus();
+    }
+    // Audit a failed attempt against the attempted user's identity, without
+    // routing through logAction (which gates on state.user being set).
+    state.audit.push({
+      timestamp: Date.now(),
+      userId: u.email,
+      userName: (u.firstName + ' ' + u.lastName).trim(),
+      userTitle: u.title,
+      action: 'SIGN_IN_FAILED',
+      entityType: null, entityLabel: null,
+      details: `Incorrect password (attempt ${entry.failedCount})`
+    });
+    saveAudit();
+    return;
+  }
+
+  // Success — clear the failure counter for this user.
+  await clearFailedAttempts(u.id);
+  clearSigninTimer();
+
+  state.user = { id: u.id, email: u.email, firstName: u.firstName, lastName: u.lastName, title: u.title, profileImage: u.profileImage || null };
+  state.signinUserId = null;
+  logAction('SIGN_IN', null, null, 'Operator signed in');
+  enterApp();
+}
+
+async function submitSetPassword(e) {
+  e.preventDefault();
+  const u = state.data.users.find(x => x.id === state.signinUserId);
+  const errEl = document.getElementById('signinError');
+  errEl.textContent = '';
+  if (!u) { errEl.textContent = 'User no longer exists'; return; }
+  const password = e.target.password.value;
+  const confirm  = e.target.passwordConfirm.value;
+  const issue = passwordStrengthIssue(password);
+  if (issue) { errEl.textContent = issue; return; }
+  if (password !== confirm) { errEl.textContent = 'Passwords do not match'; return; }
+
+  const salt = generateSalt();
+  const hash = await hashPassword(password, salt, PASSWORD_ITERATIONS);
+  const idx = state.data.users.findIndex(x => x.id === u.id);
+  state.data.users[idx] = {
+    ...u,
+    passwordHash: hash,
+    passwordSalt: salt,
+    passwordIterations: PASSWORD_ITERATIONS,
+    lastModifiedAt: Date.now()
+  };
+  await saveType('users');
+  // Belt-and-suspenders: clear any stale lockout entry for this user.
+  await clearFailedAttempts(u.id);
+
+  state.user = { id: u.id, email: u.email, firstName: u.firstName, lastName: u.lastName, title: u.title, profileImage: u.profileImage || null };
+  state.signinUserId = null;
+  logAction('PASSWORD_SET', 'users', u.email, 'Set initial password for legacy account');
+  logAction('SIGN_IN', null, null, 'Operator signed in');
+  enterApp();
+}
+
+/* v51: two-letter monogram for a user · first initial + last initial,
+   uppercase. Used as the fallback content for the user-chip avatar and
+   the users-list thumb column when a user has no profileImage set. */
+function userInitials(u) {
+  if (!u) return '?';
+  const fn = String(u.firstName || '').trim();
+  const ln = String(u.lastName  || '').trim();
+  const f = fn ? fn[0].toUpperCase() : '';
+  const l = ln ? ln[0].toUpperCase() : '';
+  return (f + l) || '?';
+}
+
+/* v51: render the user-chip in the topbar from state.user. The chip's
+   DOM lives in the static topbar HTML (not re-rendered by render()), so
+   we mutate it imperatively. Called from enterApp() on every sign-in /
+   session restore, and from submitForm() when the signed-in user edits
+   their own profile so the chip avatar / name / title flip immediately
+   without waiting for a refresh. */
+function refreshUserChip() {
+  if (!state.user) return;
+  const nameEl  = document.getElementById('userChipName');
+  const titleEl = document.getElementById('userChipTitle');
+  const avEl    = document.getElementById('userChipAvatar');
+  if (nameEl)  nameEl.textContent  = state.user.firstName + ' ' + state.user.lastName;
+  if (titleEl) titleEl.textContent = state.user.title || '';
+  if (avEl) {
+    avEl.innerHTML = state.user.profileImage && typeof state.user.profileImage === 'string'
+      ? `<img src="${escapeHtml(state.user.profileImage)}" alt="">`
+      : `<span class="user-chip-initials">${escapeHtml(userInitials(state.user))}</span>`;
+  }
+}
+
+/* v56: detect "IT" in a user's title as a whole word, case-insensitive.
+   Matches "IT", "IT Manager", "Senior IT Engineer", "Manager, IT" etc.
+   Does NOT match "Auditor", "Editor", "Items", or other titles where
+   "it" appears as part of a longer word. */
+function userTitleContainsIT(title) {
+  if (!title || typeof title !== 'string') return false;
+  return /\bit\b/i.test(title);
+}
+
+/* v56: locate the LHD Warehouse site, accommodating minor name variations.
+   Returns the first match: exact name (case-insensitive), or fall back to
+   anything starting with "LHD " (e.g. "LHD Warehouse 2"). Returns null if
+   no LHD site exists in the data — caller then leaves working-site as-is. */
+function findLHDWarehouseSite() {
+  const sites = state.data.sites || [];
+  let s = sites.find(x => (x.name || '').trim().toLowerCase() === 'lhd warehouse');
+  if (s) return s;
+  return sites.find(x => /^\s*lhd\b/i.test(x.name || '')) || null;
+}
+
+/* v56: rule — if the current user's title contains "IT", default their
+   working-site to LHD Warehouse. Only applied when the per-device
+   workingSiteIds is empty (i.e. the implicit "All Sites" state). A user
+   who has already chosen a specific site keeps that choice.
+
+   Trade-off: an IT user who explicitly picks "All Sites" will be re-
+   defaulted to LHD on their next sign-in (because the "all sites" state
+   is indistinguishable from "no choice yet"). If that becomes a
+   problem, add a per-user × per-device "applied" flag so the default
+   only kicks in once. Keeping it simple until that's needed. */
+function applyDefaultWorkingSiteForIT() {
+  if (!state.user || !userTitleContainsIT(state.user.title)) return;
+  if (state.workingSiteIds && state.workingSiteIds.size > 0) return;
+  const lhd = findLHDWarehouseSite();
+  if (!lhd) return;
+  state.workingSiteIds = new Set([lhd.id]);
+  // saveWorkingSites is per-device localStorage; don't await — fire-
+  // and-forget so the rest of enterApp continues without blocking.
+  try { saveWorkingSites(); } catch (e) { /* non-fatal */ }
+}
+
+function enterApp() {
+  clearSigninTimer();
+  // Persist a per-device session marker so a page refresh doesn't kick the
+  // user back to the sign-in screen. We deliberately store ONLY the user id
+  // (plus a timestamp for future TTL logic) — not the password, not the
+  // hash, not the user's name/email. On restore we look the user up from
+  // state.data.users so any cross-device edits to the user record (name,
+  // title, email) are picked up automatically. Raw localStorage, never
+  // window.storage — sessions must NOT mirror to cloud, or signing in on
+  // one device would sign in everyone.
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify({
+      userId: state.user.id,
+      signedInAt: Date.now()
+    }));
+  } catch (e) { /* non-fatal — session just won't survive refresh */ }
+  document.getElementById('signinOverlay').style.display = 'none';
+  document.getElementById('appShell').style.display = 'block';
+  // v51: refresh chip via helper so avatar (image or initials), name, and
+  // title all stay in sync. Same helper is reused when the user edits their
+  // own profile (submitForm) so the chip updates immediately on save.
+  refreshUserChip();
+  // v56: apply the IT-title → LHD Warehouse default. Must run BEFORE the
+  // working-site button refresh so the label reflects the new selection.
+  // No-op when (a) user isn't IT, (b) workingSiteIds already set, or
+  // (c) no LHD site exists — see applyDefaultWorkingSiteForIT.
+  applyDefaultWorkingSiteForIT();
+  // Working-site button reflects the per-device selection (loaded by
+  // loadWorkingSitesFromStorage() at boot). Refresh on every enterApp()
+  // call so a sign-in/sign-out cycle in the same tab still picks up the
+  // right state — and in case state.data.sites has changed since boot,
+  // dead-id pruning happens here automatically via workingSiteSetPruned().
+  refreshWorkingSiteBtnLabel();
+  // Show the Logo entry in the gear menu only for the permitted profile.
+  // Defense-in-depth: setLogo/clearLogo also re-check, and renderLogoView
+  // shows an access-denied panel if a non-permitted user reaches it.
+  const logoMenuItem = document.getElementById('settingsMenuLogo');
+  if (logoMenuItem) logoMenuItem.style.display = isLogoAdmin() ? '' : 'none';
+  state.activeTab = 'dashboard';
+  document.querySelectorAll('#primaryTabs [data-tab]').forEach(t => t.classList.toggle('active', t.dataset.tab === 'dashboard'));
+  render();
+}
+
+function signOut() {
+  if (!state.user) return;
+  logAction('SIGN_OUT', null, null, 'Operator signed out');
+  try { localStorage.removeItem(SESSION_KEY); } catch (e) { /* non-fatal */ }
+  state.user = null;
+  state.signinUserId = null;
+  renderSignIn();
+}
+
+/* ---------- TAB SWITCHING ---------- */
+document.getElementById('primaryTabs').addEventListener('click', e => {
+  const btn = e.target.closest('[data-tab]');
+  if (!btn) return;
+  document.querySelectorAll('#primaryTabs [data-tab]').forEach(t => t.classList.remove('active'));
+  btn.classList.add('active');
+  state.activeTab = btn.dataset.tab;
+  closeSidebar();
+  render();
+});
+
+/* ---------- RENDER ENTRY ---------- */
+function updateCounts() {
+  document.getElementById('count_items').textContent = state.data.items.length;
+}
+
+/* ---------- SIDEBAR TOGGLE (mobile) ----------
+   On wide screens the sidebar is always visible. On narrow screens it
+   slides in/out as an overlay; the hamburger toggles it and clicking the
+   backdrop or any nav item closes it. */
+function toggleSidebar() {
+  const sb = document.getElementById('sidebar');
+  if (!sb) return;
+  sb.classList.toggle('open');
+}
+function closeSidebar() {
+  const sb = document.getElementById('sidebar');
+  if (sb) sb.classList.remove('open');
+}
+
+/* Settings (gear) dropdown menu — toggles open/close and closes on outside
+   click or Escape. The body-level click handler is registered once below. */
+function toggleSettingsMenu(e) {
+  if (e) e.stopPropagation();
+  const menu = document.getElementById('settingsMenu');
+  const btn  = document.getElementById('gearBtn');
+  if (!menu || !btn) return;
+  const willOpen = !menu.classList.contains('open');
+  menu.classList.toggle('open', willOpen);
+  btn.classList.toggle('open', willOpen);
+  btn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+}
+function closeSettingsMenu() {
+  const menu = document.getElementById('settingsMenu');
+  const btn  = document.getElementById('gearBtn');
+  if (menu) menu.classList.remove('open');
+  if (btn)  { btn.classList.remove('open'); btn.setAttribute('aria-expanded', 'false'); }
+}
+document.addEventListener('click', e => {
+  const menu = document.getElementById('settingsMenu');
+  if (!menu || !menu.classList.contains('open')) return;
+  // Clicks inside the menu or on the gear button itself are handled separately.
+  if (e.target.closest('.settings-wrap')) return;
+  closeSettingsMenu();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeSettingsMenu();
+});
+
+function renderSecondaryTabs(tabs, activeKey, handler) {
+  const sec = document.getElementById('secondaryTabs');
+  sec.style.display = 'flex';
+  sec.innerHTML = tabs.map(t => `
+    <button class="tab ${t.key === activeKey ? 'active' : ''}" data-key="${t.key}">
+      ${t.label}${t.hideCount ? '' : ` <span class="tab-count">${t.count}</span>`}
+    </button>
+  `).join('');
+  sec.onclick = e => {
+    const btn = e.target.closest('[data-key]'); if (!btn) return;
+    handler(btn.dataset.key);
+  };
+}
+
+function render() {
+  updateCounts();
+  // v61 (Request 2): if the user was on a list view with the search-scan
+  // floater showing, drop it before re-rendering. The search input it was
+  // attached to is about to be destroyed and the floater would otherwise
+  // be left orphaned at the bottom of the screen across tab switches.
+  if (typeof hideSearchScanFloater === 'function') hideSearchScanFloater();
+  // Working-site button label can go stale if a site is deleted/renamed
+  // while the user is signed in. Refreshing here is cheap and guarantees
+  // the topbar always matches the current scope state.
+  refreshWorkingSiteBtnLabel();
+  // Items-list selection is session-only and scoped to the All Items view.
+  // Whenever the user navigates to any other tab, drop the selection so they
+  // don't return to a stale checkbox state. (Renders within the items tab —
+  // e.g. after editing an item — leave the selection untouched.)
+  if (state.activeTab !== 'items' && state.selectedItemIds.size > 0) {
+    state.selectedItemIds.clear();
+  }
+  // v50 (Item 2): clear the items-site "user override" flag when leaving
+  // the Items tab so the next visit re-syncs the site dropdown from the
+  // global working-site selection.
+  if (state.activeTab !== 'items' && state._itemsSiteUserOverride) {
+    state._itemsSiteUserOverride = false;
+  }
+  // Same idea for the active-report selection: leaving the Reports tab
+  // returns the next visit to the report list rather than the last-viewed
+  // detail page.
+  if (state.activeTab !== 'reports' && state.activeReport) {
+    state.activeReport = null;
+  }
+  // Columns popovers belong to the Items and Categories tabs. If the user
+  // navigates anywhere else, close the popover so its lingering open
+  // state doesn't auto-open the panel on return to a sibling tab.
+  if (state.activeTab !== 'items' && state.activeTab !== 'categories' && state.columnsPanelOpen) {
+    state.columnsPanelOpen = false;
+    if (document._columnsPanelOutsideHandler) {
+      document.removeEventListener('click', document._columnsPanelOutsideHandler);
+      delete document._columnsPanelOutsideHandler;
+    }
+    if (document._categoryItemsColumnsPanelOutsideHandler) {
+      document.removeEventListener('click', document._categoryItemsColumnsPanelOutsideHandler);
+      delete document._categoryItemsColumnsPanelOutsideHandler;
+    }
+  }
+  // Dashboard MANAGE CARDS popover is similar — only belongs to Dashboard.
+  if (state.activeTab !== 'dashboard' && state.dashboardCardsPanelOpen) {
+    state.dashboardCardsPanelOpen = false;
+    if (document._dashboardCardsPanelOutsideHandler) {
+      document.removeEventListener('click', document._dashboardCardsPanelOutsideHandler);
+      delete document._dashboardCardsPanelOutsideHandler;
+    }
+  }
+  const main = document.getElementById('mainContent');
+  const sec = document.getElementById('secondaryTabs');
+  sec.style.display = 'none';
+
+  // v66/v68: in Simple view mode, the tab bar is the user's ONLY way to
+  // navigate. The shell wraps every active tab — including settings — so
+  // the user can always tap ACTIONS or ITEM SEARCH to exit. Without this,
+  // entering Settings via the gear menu left the user stranded with no
+  // sidebar (display:none) and no other nav affordance.
+  if (state.viewMode === 'simple') {
+    if (state.activeTab !== 'actions' && state.activeTab !== 'itemSearch' && state.activeTab !== 'settings') {
+      state.activeTab = 'actions';
+    }
+    renderSimpleShell(main);
+    return;
+  }
+
+  switch (state.activeTab) {
+    case 'dashboard': renderDashboard(main); break;
+    case 'items':
+      renderSecondaryTabs([
+        { key: 'list', label: 'All Items', count: state.data.items.length },
+        { key: 'add',  label: 'Add New Inventory Item',  count: 0, hideCount: true }
+      ], state.activeItemsTab, k => {
+        // Clicking "Add New Inventory Item" opens the form modal directly over
+        // the All Items list — no separate destination page. The activeItemsTab
+        // therefore stays on 'list' so the user always sees the list behind the
+        // modal and lands back on it after save or cancel.
+        if (k === 'add') { openForm('items'); return; }
+        state.activeItemsTab = k;
+        render();
+      });
+      renderListPage(main, 'items');
+      break;
+    case 'actions':
+      renderSecondaryTabs([
+        { key: 'add',     label: 'Add',     count: 0, hideCount: true },
+        { key: 'remove',  label: 'Remove',  count: 0, hideCount: true },
+        { key: 'adjust',  label: 'Adjust',  count: 0, hideCount: true },
+        { key: 'move',    label: 'Move',    count: 0, hideCount: true },
+        { key: 'history', label: 'History', count: state.actionLog.length }
+      ], state.activeActionsTab, k => { state.activeActionsTab = k; render(); });
+      if      (state.activeActionsTab === 'history') renderActionHistory(main);
+      else                                           renderActionForm(main, state.activeActionsTab);
+      break;
+    case 'reports':   renderReports(main); break;
+    case 'categories': renderCategoriesView(main); break;
+    case 'lookups':
+      renderSecondaryTabs([
+        { key: 'sites',      label: 'Sites',      count: state.data.sites.length },
+        { key: 'locations',  label: 'Locations',  count: state.data.locations.length },
+        { key: 'categories', label: 'Categories', count: state.data.categories.length },
+        { key: 'customers',  label: 'Customers',  count: state.data.customers.length }
+      ], state.activeLookupTab, k => { state.activeLookupTab = k; state.activeCustomerView = null; render(); });
+      // When the user has drilled into a specific customer's view (via the
+      // VIEW button on a customer row), render that instead of the list.
+      // Switching sub-tabs clears activeCustomerView (handler above) so a
+      // stale id can't survive a context change.
+      if (state.activeLookupTab === 'customers' && state.activeCustomerView) {
+        renderCustomerView(main, state.activeCustomerView);
+      } else {
+        renderListPage(main, state.activeLookupTab);
+      }
+      break;
+    case 'manage':
+      renderSecondaryTabs([
+        { key: 'users', label: 'Users',     count: state.data.users.length },
+        { key: 'audit', label: 'Audit Log', count: state.audit.length }
+      ], state.activeManageTab, k => { state.activeManageTab = k; render(); });
+      if (state.activeManageTab === 'users') renderListPage(main, 'users');
+      else renderAudit(main);
+      break;
+    case 'settings':
+      // Reached via the gear menu. Views: import hub, full-page importer,
+      // theme picker, cloud sync setup.
+      if (state.settingsView === 'import') {
+        renderImportView(main, state.activeCSVTab, { handler: 'returnToImportHub', label: 'Import Hub' });
+      } else if (state.settingsView === 'theme') {
+        renderThemeView(main);
+      } else if (state.settingsView === 'viewMode') {
+        renderViewModeView(main);
+      } else if (state.settingsView === 'cloudSync') {
+        renderCloudSyncView(main);
+      } else if (state.settingsView === 'logo') {
+        renderLogoView(main);
+      } else {
+        renderImportHub(main);
+      }
+      break;
+  }
+}
+
+/* ============ DASHBOARD ============ */
+function renderDashboard(root) {
+  // Resolve the active scope from the global Working Site selector. An
+  // empty scope set means "all sites" (the default); otherwise the
+  // dashboard data narrows to placements/items at sites whose ids are in
+  // the set. workingSiteSetPruned() also silently drops any saved ids
+  // whose site has since been deleted, so we never get stuck rendering
+  // against a phantom selection.
+  const scopeIds       = workingSiteSetPruned();
+  const filterActive   = scopeIds.size > 0;
+  // Friendly label for the filter: single site → its name, multi → count + names.
+  const scopedSites    = filterActive
+    ? state.data.sites.filter(s => scopeIds.has(s.id)).sort((a, b) => a.name.localeCompare(b.name))
+    : [];
+  const scopeShortName = filterActive
+    ? (scopedSites.length === 1 ? scopedSites[0].name : `${scopedSites.length} sites`)
+    : 'All sites';
+  const scopeLongList  = filterActive
+    ? scopedSites.map(s => s.name).join(', ')
+    : '';
+
+  // Build cost / category lookups once: itemId -> primitive
+  const itemCost = {}, itemList = {}, itemCatName = {}, itemCatId = {};
+  state.data.items.forEach(i => {
+    itemCost[i.id]    = Number(i.cost)      || 0;
+    itemList[i.id]    = Number(i.listPrice) || 0;
+    const cat = state.data.categories.find(c => c.id === i.categoryId);
+    itemCatName[i.id] = cat ? (categoryPathName(i.categoryId) || cat.name) : '— uncategorized —';
+    itemCatId[i.id]   = i.categoryId || null;
+  });
+
+  // Placements in scope — filter when a working scope is active, otherwise the full set.
+  const scopedPlacements = filterActive
+    ? state.data.placements.filter(p => scopeIds.has(p.siteId))
+    : state.data.placements;
+
+  // Distinct item ids referenced by in-scope placements. When filtered, this
+  // is the universe of items we care about for the SKU / category counts and
+  // the low-stock list.
+  const scopedItemIds = new Set(scopedPlacements.map(p => p.itemId));
+
+  // Inventory totals (always derived from scoped placements)
+  const totalUnits     = scopedPlacements.reduce((s,p) => s + (Number(p.quantity)||0), 0);
+  const totalCost      = scopedPlacements.reduce((s,p) => s + (Number(p.quantity)||0) * (itemCost[p.itemId]||0), 0);
+  const totalListValue = scopedPlacements.reduce((s,p) => s + (Number(p.quantity)||0) * (itemList[p.itemId]||0), 0);
+
+  // SKU count: when filtered, only items that have a placement in scope.
+  const totalSKUs = filterActive ? scopedItemIds.size : state.data.items.length;
+
+  // Categories count: all categories (unfiltered) vs categories actually used in scope
+  const scopedCategoryIds = new Set();
+  scopedPlacements.forEach(p => {
+    const cid = itemCatId[p.itemId];
+    if (cid) scopedCategoryIds.add(cid);
+  });
+  const totalCategories = filterActive ? scopedCategoryIds.size : state.data.categories.length;
+
+  // Locations: when filtered, only locations belonging to a scoped site
+  const totalLocations = filterActive
+    ? state.data.locations.filter(l => scopeIds.has(l.siteId)).length
+    : state.data.locations.length;
+  const totalSites = filterActive ? scopedSites.length : state.data.sites.length;
+
+  // Top-categories chart — aggregate from scoped placements
+  const byCat = {};
+  scopedPlacements.forEach(p => {
+    const name = itemCatName[p.itemId] || '— unknown —';
+    byCat[name] = (byCat[name] || 0) + (Number(p.quantity)||0) * (itemCost[p.itemId]||0);
+  });
+  const catEntries = Object.entries(byCat).sort((a,b)=>b[1]-a[1]).slice(0,6);
+  const catMax = Math.max(1, ...catEntries.map(e=>e[1]));
+
+  const recent = [...state.audit].slice(-8).reverse();
+
+  // Low-stock alerts.
+  // v59 (Request 1): when a working site is set, ask lowStockItems for
+  // items whose qty WITHIN the working sites is below their minStock.
+  // This treats minStock as "minimum across the user's selected sites"
+  // which is the most useful semantics for the dashboard — answers
+  // "what do I need to restock at MY sites?". Without a working site
+  // the function falls back to global qty (unchanged from before).
+  // itemsWithMinStock is the universe count used for the "all clear"
+  // copy below — also scoped when filterActive to keep messages honest.
+  const lowStock            = lowStockItems(filterActive ? scopeIds : undefined);
+  const itemsWithMinStockAll = state.data.items.filter(i => i.minStock != null && i.minStock !== '' && Number(i.minStock) > 0);
+  const itemsWithMinStockScoped = filterActive
+    ? itemsWithMinStockAll.filter(i => scopedItemIds.has(i.id))
+    : itemsWithMinStockAll;
+  const itemsWithMinStock = itemsWithMinStockScoped.length;
+
+  root.innerHTML = `
+    <div class="page-head">
+      <div>
+        <div class="page-title">DASHBOARD</div>
+        <div class="page-sub">// Welcome, ${escapeHtml(state.user.firstName)} · ${escapeHtml(state.user.title)} · ${filterActive
+          ? `<span style="color:var(--amber);" title="${escapeHtml(scopeLongList)}">Filtered to ${escapeHtml(scopeShortName)}</span>`
+          : `Showing all ${state.data.sites.length} site${state.data.sites.length===1?'':'s'}`}</div>
+      </div>
+      <div class="dash-head-right" style="display:flex;flex-direction:column;align-items:flex-end;gap:8px;">
+        <div class="page-sub" style="margin:0;">${new Date().toLocaleString()}</div>
+        <!-- MANAGE CARDS popover anchor. Reuses the existing .columns-anchor /
+             .columns-panel styling but with a dashboard-specific id + handlers.
+             The popover only controls the 9 status cards in the two stat grids
+             below; the Low Stock Alerts, Top Categories, and Recent Activity
+             cards have their own collapse / always-visible behavior. -->
+        <div class="columns-anchor">
+          <button class="btn ghost sm" onclick="toggleDashboardCardsPanel(event)" aria-haspopup="true" aria-expanded="${state.dashboardCardsPanelOpen ? 'true' : 'false'}" title="Hide or show status cards">⋮ MANAGE CARDS</button>
+          <div id="dashboardCardsPanel" class="columns-panel" style="${state.dashboardCardsPanelOpen ? '' : 'display:none;'}">${renderDashboardCardsPanel()}</div>
+        </div>
+      </div>
+    </div>
+
+    ${(() => {
+      // Catalog of all 9 status cards. Stable keys (used by
+      // state.dashboardHiddenCards and the MANAGE CARDS popover); the
+      // visible label is what shows in the popover checkbox list.
+      // The html for each is built inline so we can interpolate the
+      // already-computed scope-aware values from above without copying
+      // the math into a separate function.
+      const cards = [
+        { key: 'totalSKUs',      label: 'Total SKUs',         grid: 1, html: `<div class="stat"><div class="stat-label">Total SKUs</div><div class="stat-value">${totalSKUs.toLocaleString()}</div><div class="stat-meta">// ${filterActive ? `Items at ${escapeHtml(scopeShortName)}` : 'Master items'}</div></div>` },
+        { key: 'unitsOnHand',    label: 'Units On Hand',      grid: 1, html: `<div class="stat cyan"><div class="stat-label">Units On Hand</div><div class="stat-value">${totalUnits.toLocaleString()}</div><div class="stat-meta">// Sum of quantities${filterActive ? ' in scope' : ''}</div></div>` },
+        { key: 'inventoryCost',  label: 'Inventory Cost',     grid: 1, html: `<div class="stat green"><div class="stat-label">Inventory Cost</div><div class="stat-value">${fmt$(totalCost)}</div><div class="stat-meta">// Quantity × cost${filterActive ? ' in scope' : ''}</div></div>` },
+        { key: 'listValue',      label: 'List Value',         grid: 1, html: `<div class="stat orange"><div class="stat-label">List Value</div><div class="stat-value">${fmt$(totalListValue)}</div><div class="stat-meta">// Quantity × list price${filterActive ? ' in scope' : ''}</div></div>` },
+        { key: 'placements',     label: 'Placements',         grid: 2, html: `<div class="stat cyan"><div class="stat-label">Placements</div><div class="stat-value">${scopedPlacements.length}</div><div class="stat-meta">// Item × site × location${filterActive ? ` in ${escapeHtml(scopeShortName)}` : ''}</div></div>` },
+        { key: 'sitesLocations', label: 'Sites · Locations',  grid: 2, html: `<div class="stat cyan"><div class="stat-label">Sites · Locations</div><div class="stat-value">${totalSites} · ${totalLocations}</div><div class="stat-meta">// ${filterActive ? `In scope` : 'Physical hierarchy'}</div></div>` },
+        { key: 'categoriesCard', label: 'Categories',         grid: 2, html: `<div class="stat cyan"><div class="stat-label">Categories</div><div class="stat-value">${totalCategories.toLocaleString()}</div><div class="stat-meta">// ${filterActive ? 'Used in scope' : 'Item classes'}</div></div>` },
+        { key: 'customersUsers', label: 'Customers · Users',  grid: 2, html: `<div class="stat cyan" title="${filterActive ? 'Customers and Users are not site-scoped — these counts stay global.' : ''}"><div class="stat-label">Customers · Users</div><div class="stat-value">${state.data.customers.length} · ${state.data.users.length}</div><div class="stat-meta">// ${filterActive ? '<span style="color:var(--text-faint);">Global · not filtered</span>' : 'Account records'}</div></div>` },
+        { key: 'lowStock',       label: 'Low Stock',          grid: 2, html: `<div class="stat${lowStock.length > 0 ? ' red' : ''}" style="${lowStock.length > 0 ? 'cursor:pointer;' : ''}" ${lowStock.length > 0 ? 'onclick="goTab(\'items\'); state.activeItemsTab=\'list\'; render();" title="Jump to Items list"' : ''}>
+          <div class="stat-label">Low Stock</div>
+          <div class="stat-value">${lowStock.length.toLocaleString()}</div>
+          <div class="stat-meta">// ${itemsWithMinStock === 0 ? (filterActive ? 'No watched items in scope' : 'No thresholds set') : (lowStock.length === 0 ? 'All above threshold' : `Below min · ${itemsWithMinStock} watched`)}</div>
+        </div>` }
+      ];
+      // Stash for the MANAGE CARDS popover renderer (so it knows the labels
+      // and ordering). Updated on every dashboard render; the popover reads
+      // this when it draws its checkbox list.
+      DASHBOARD_CARD_CATALOG = cards.map(c => ({ key: c.key, label: c.label }));
+      const hidden = new Set(state.dashboardHiddenCards);
+      const visibleGrid1 = cards.filter(c => c.grid === 1 && !hidden.has(c.key));
+      const visibleGrid2 = cards.filter(c => c.grid === 2 && !hidden.has(c.key));
+      let out = '';
+      if (visibleGrid1.length > 0) {
+        out += `<div class="stat-grid">${visibleGrid1.map(c => c.html).join('')}</div>`;
+      }
+      if (visibleGrid2.length > 0) {
+        // Keep the 5-column shape when all five cards are visible so spacing
+        // matches the prior layout; let it auto-flow otherwise.
+        const gridStyle = visibleGrid2.length === 5 ? ' style="grid-template-columns:repeat(5,1fr);"' : '';
+        out += `<div class="stat-grid"${gridStyle}>${visibleGrid2.map(c => c.html).join('')}</div>`;
+      }
+      if (visibleGrid1.length === 0 && visibleGrid2.length === 0) {
+        out += `<div class="card"><div class="card-body"><div class="empty"><div class="empty-text">// ALL STATUS CARDS HIDDEN — use ⋮ MANAGE CARDS above to show some</div></div></div></div>`;
+      }
+      return out;
+    })()}
+
+    ${itemsWithMinStock > 0 ? `
+      <div class="card" style="margin-bottom:24px;${lowStock.length > 0 && !state.lowStockCollapsed ? 'border-left:3px solid var(--red);' : ''}">
+        <div class="card-head" style="cursor:pointer;" onclick="toggleLowStockCollapsed()" title="${state.lowStockCollapsed ? 'Click to expand' : 'Click to collapse'}">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <span class="cat-chevron" aria-hidden="true">${state.lowStockCollapsed ? '▶' : '▼'}</span>
+            <div class="card-title">${lowStock.length > 0 ? '⚠ ' : ''}Low Stock Alerts${filterActive ? ` · ${escapeHtml(scopeShortName)}` : ''}</div>
+          </div>
+          <div class="page-sub" style="margin:0;color:${lowStock.length > 0 ? 'var(--red)' : 'var(--text-dim)'};">${lowStock.length > 0 ? `${lowStock.length} item${lowStock.length === 1 ? '' : 's'} below threshold` : `All ${itemsWithMinStock} watched item${itemsWithMinStock === 1 ? '' : 's'} above threshold`}</div>
+        </div>
+        ${state.lowStockCollapsed ? '' : `
+        <div class="card-body" style="padding:0;">
+          ${lowStock.length === 0 ? `
+            <div class="empty" style="padding:24px;">
+              <div class="empty-text" style="color:var(--green);">// ALL CLEAR — every watched item is at or above its minimum</div>
+            </div>
+          ` : `
+            <div class="table-wrap">
+              <table>
+                <thead><tr>
+                  <th>Item #</th>
+                  <th>Name</th>
+                  <th style="text-align:right;" title="${filterActive ? `Qty across your selected working site${scopeIds.size === 1 ? '' : 's'}` : 'Qty across all sites'}">On Hand${filterActive ? ` · ${escapeHtml(scopeShortName)}` : ''}</th>
+                  <th style="text-align:right;">Min</th>
+                  <th style="text-align:right;">Shortage</th>
+                  <th></th>
+                </tr></thead>
+                <tbody>
+                  ${lowStock.map(({ item, qty, min, shortage }) => `
+                    <tr>
+                      <td><span class="id-tag">${escapeHtml(item.itemNumber)}</span></td>
+                      <td>${item.name ? escapeHtml(item.name) : '<span class="muted">—</span>'}</td>
+                      <td style="text-align:right;"><span class="mono" style="${qty === 0 ? 'color:var(--red);' : ''}">${qty.toLocaleString()}</span></td>
+                      <td style="text-align:right;"><span class="mono">${min.toLocaleString()}</span></td>
+                      <td style="text-align:right;"><strong class="mono" style="color:var(--red);">−${shortage.toLocaleString()}</strong></td>
+                      <td class="actions-cell"><button class="btn ghost sm" onclick="event.stopPropagation(); openForm('items', '${item.id}')" title="Edit item — adjust threshold or details">EDIT</button></td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            </div>
+          `}
+        </div>`}
+      </div>
+    ` : ''}
+
+    <div class="dash-bottom-grid">
+      <div class="card">
+        <div class="card-head" style="cursor:pointer;" onclick="toggleDashboardSection('topCategories')" title="${state.dashboardCollapsed.topCategories ? 'Click to expand' : 'Click to collapse'}">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <span class="cat-chevron" aria-hidden="true">${state.dashboardCollapsed.topCategories ? '▶' : '▼'}</span>
+            <div class="card-title">Top Categories by Cost${filterActive ? ` · ${escapeHtml(scopeShortName)}` : ''}</div>
+          </div>
+        </div>
+        ${state.dashboardCollapsed.topCategories ? '' : `
+        <div class="card-body">
+          ${catEntries.length === 0 ? `<div class="empty"><div class="empty-icon">∅</div><div class="empty-text">// ${filterActive ? 'NO INVENTORY IN SCOPE' : 'NO INVENTORY YET'}</div></div>` :
+            catEntries.map(([name, val]) => `
+              <div class="bar-row">
+                <div class="bar-label">${escapeHtml(name)}</div>
+                <div class="bar-track"><div class="bar-fill" style="width:${(val/catMax*100).toFixed(1)}%"></div></div>
+                <div class="bar-value">${fmt$(val)}</div>
+              </div>`).join('')
+          }
+        </div>`}
+      </div>
+      <div class="card">
+        <div class="card-head" style="cursor:pointer;" onclick="toggleDashboardSection('recentActivity')" title="${state.dashboardCollapsed.recentActivity ? 'Click to expand' : 'Click to collapse'}">
+          <div style="display:flex;align-items:center;gap:10px;">
+            <span class="cat-chevron" aria-hidden="true">${state.dashboardCollapsed.recentActivity ? '▶' : '▼'}</span>
+            <div class="card-title">Recent Activity</div>
+          </div>
+          ${filterActive ? `<div class="page-sub" style="margin:0;color:var(--text-faint);" title="The audit log is global — events aren't tagged with a site, so this list isn't filtered.">// Global · not filtered</div>` : ''}
+        </div>
+        ${state.dashboardCollapsed.recentActivity ? '' : `
+        <div class="card-body" style="padding:0;">
+          ${recent.length === 0 ? `<div class="empty"><div class="empty-icon">∅</div><div class="empty-text">// NO ACTIVITY LOGGED</div></div>` :
+            recent.map(a => `
+              <div class="audit-row" style="grid-template-columns:140px 1fr 110px;">
+                <div class="audit-time">${fmtDate(a.timestamp)}</div>
+                <div>
+                  <div class="audit-user">${escapeHtml(a.userName)}</div>
+                  <div class="audit-user-sub">${escapeHtml(a.userTitle||'')}</div>
+                </div>
+                <div><span class="badge ${actionBadgeClass(a.action)}">${escapeHtml(a.action)}</span></div>
+              </div>`).join('')
+          }
+        </div>`}
+      </div>
+    </div>
+
+    ${state.data.items.length === 0 ? `
+      <div class="card" style="margin-top:24px;">
+        <div class="card-head"><div class="card-title">Get Started</div></div>
+        <div class="card-body">
+          <div class="notice">// Add items one at a time under <strong>Items → Add Item</strong>, or bulk-import everything at once via the gear menu (top-right) → <strong>Import Data</strong>. Once items are in, use <strong>Actions → Add</strong> to record stock at sites and locations.</div>
+          <div class="btn-row">
+            <button class="btn" onclick="goTab('items')">+ Items</button>
+            <button class="btn ghost" onclick="goImportHub()">↑ Bulk import via CSV</button>
+          </div>
+        </div>
+      </div>` : ''}
+  `;
+}
+function actionBadgeClass(a){
+  if (/_CREATE|SIGN_IN|CSV_IMPORT/.test(a)) return 'green';
+  if (/_UPDATE/.test(a)) return 'amber';
+  if (/_DELETE/.test(a)) return 'red';
+  if (/CSV_DUPLICATE_SKIP/.test(a)) return 'orange';
+  return '';
+}
+function goTab(t){ state.activeTab = t; document.querySelectorAll('#primaryTabs [data-tab]').forEach(b=>b.classList.toggle('active', b.dataset.tab === t)); render(); }
+
+/* ---------- DASHBOARD: MANAGE CARDS POPOVER (v49) ----------
+   Lets the user hide / show any of the 9 status cards on the dashboard.
+   Persistence: state.dashboardHiddenCards is cloud-synced via
+   KEYS.dashboardCards, so a card hidden on one device is hidden on
+   every signed-in device. The popover anchors to a button in the
+   Dashboard's page-head and uses the existing .columns-panel / .cp-*
+   styling for visual consistency with the items-list COLUMNS popover.
+
+   DASHBOARD_CARD_CATALOG is populated by renderDashboard() on every
+   render — keyed by stable string id with the user-facing label. The
+   popover reads from this on draw. Living up there means the catalog
+   is always in sync with the cards the render is actually emitting. */
+let DASHBOARD_CARD_CATALOG = [];
+
+function isDashboardCardHidden(key) {
+  return state.dashboardHiddenCards.includes(key);
+}
+
+async function toggleDashboardCardVisibility(key) {
+  const hidden = new Set(state.dashboardHiddenCards);
+  if (hidden.has(key)) hidden.delete(key); else hidden.add(key);
+  state.dashboardHiddenCards = Array.from(hidden);
+  await saveDashboardCards();
+  // Re-render dashboard to reflect changes, then re-open the panel and
+  // refresh its contents (re-render closes it).
+  const wasOpen = state.dashboardCardsPanelOpen;
+  render();
+  if (wasOpen) {
+    state.dashboardCardsPanelOpen = true;
+    refreshDashboardCardsPanel();
+  }
+}
+
+async function showAllDashboardCards() {
+  state.dashboardHiddenCards = [];
+  await saveDashboardCards();
+  const wasOpen = state.dashboardCardsPanelOpen;
+  render();
+  if (wasOpen) {
+    state.dashboardCardsPanelOpen = true;
+    refreshDashboardCardsPanel();
+  }
+}
+
+async function saveDashboardCards() {
+  try {
+    await window.storage.set(KEYS.dashboardCards, JSON.stringify({ hidden: state.dashboardHiddenCards }), SHARED);
+  } catch (e) { /* non-fatal — change still works for the session */ }
+}
+
+function toggleDashboardCardsPanel(e) {
+  if (e) e.stopPropagation();
+  state.dashboardCardsPanelOpen = !state.dashboardCardsPanelOpen;
+  if (state.dashboardCardsPanelOpen) {
+    // Outside-click closes the popover. Same pattern as the columns popover.
+    setTimeout(() => {
+      document._dashboardCardsPanelOutsideHandler = (ev) => {
+        const panel = document.getElementById('dashboardCardsPanel');
+        const anchor = panel && panel.closest('.columns-anchor');
+        if (!anchor || !anchor.contains(ev.target)) closeDashboardCardsPanel();
+      };
+      document.addEventListener('click', document._dashboardCardsPanelOutsideHandler);
+    }, 0);
+  } else {
+    closeDashboardCardsPanel();
+    return;
+  }
+  refreshDashboardCardsPanel();
+}
+function closeDashboardCardsPanel() {
+  state.dashboardCardsPanelOpen = false;
+  if (document._dashboardCardsPanelOutsideHandler) {
+    document.removeEventListener('click', document._dashboardCardsPanelOutsideHandler);
+    delete document._dashboardCardsPanelOutsideHandler;
+  }
+  refreshDashboardCardsPanel();
+}
+function refreshDashboardCardsPanel() {
+  const panel = document.getElementById('dashboardCardsPanel');
+  if (!panel) return;
+  panel.style.display = state.dashboardCardsPanelOpen ? '' : 'none';
+  panel.innerHTML = renderDashboardCardsPanel();
+  const btn = panel.closest('.columns-anchor')?.querySelector('button[aria-haspopup="true"]');
+  if (btn) btn.setAttribute('aria-expanded', state.dashboardCardsPanelOpen ? 'true' : 'false');
+}
+function renderDashboardCardsPanel() {
+  // Catalog is populated by the most-recent renderDashboard() call. If
+  // the panel is asked to render before the dashboard has rendered (an
+  // edge case that shouldn't happen in normal flow), fall back to an
+  // empty list rather than throwing.
+  const cards = DASHBOARD_CARD_CATALOG.length > 0 ? DASHBOARD_CARD_CATALOG : [];
+  const hidden = new Set(state.dashboardHiddenCards);
+  const rows = cards.map(c => {
+    const isHidden = hidden.has(c.key);
+    return `
+      <li class="cp-row">
+        <span class="cp-handle" aria-hidden="true" style="opacity:0;">·</span>
+        <label class="cp-checkbox-label">
+          <input type="checkbox" ${isHidden ? '' : 'checked'} onchange="toggleDashboardCardVisibility('${c.key}')" />
+          <span class="cp-name${isHidden ? ' is-hidden' : ''}">${escapeHtml(c.label)}</span>
+        </label>
+      </li>`;
+  }).join('');
+  return `
+    <div class="cp-head">
+      <div class="cp-title">DASHBOARD CARDS</div>
+      <div class="cp-hint">Tick to show, untick to hide</div>
+    </div>
+    <ul class="cp-list">${rows}</ul>
+    <div class="cp-foot">
+      <button class="btn ghost sm" onclick="showAllDashboardCards()">SHOW ALL</button>
+    </div>`;
+}
+
+/* Toggle the Low Stock Alerts card's collapse state. Session-only —
+   resets to expanded on refresh, deliberately. Persisting would mean
+   a user could land on a refreshed dashboard with critical alerts
+   silently tucked away; the cost of a single click to re-collapse on
+   each visit feels better than the surprise risk. */
+function toggleLowStockCollapsed() {
+  state.lowStockCollapsed = !state.lowStockCollapsed;
+  render();
+}
+
+/* v52: collapse / expand Top Categories by Cost and Recent Activity on
+   the Dashboard. Same session-only model as Low Stock Alerts. */
+function toggleDashboardSection(key) {
+  if (!(key in state.dashboardCollapsed)) return;
+  state.dashboardCollapsed[key] = !state.dashboardCollapsed[key];
+  render();
+}
+
+/* ============ CATEGORIES TAB ============
+   Accordion view: every category is a section that shows its rolled-up
+   inventory cost on the row when collapsed, and reveals a per-item table
+   (with cost / list / sales / qty / line cost) when expanded.
+   Total cost per category = Σ (item.cost × totalQtyForItem(item)) over the
+   items in that category. Items without a categoryId are gathered into a
+   virtual "Uncategorized" section so they don't disappear from view. */
+function renderCategoriesView(root) {
+  // Resolve the active scope from the global Working Site selector (same
+  // source as the Dashboard). Empty scope set → "all sites" / unfiltered.
+  // workingSiteSetPruned() silently drops any saved id whose site has
+  // since been deleted, so a stale selection never breaks the view.
+  const scopeIds       = workingSiteSetPruned();
+  const filterActive   = scopeIds.size > 0;
+  const scopedSites    = filterActive
+    ? state.data.sites.filter(s => scopeIds.has(s.id)).sort((a, b) => a.name.localeCompare(b.name))
+    : [];
+  const scopeShortName = filterActive
+    ? (scopedSites.length === 1 ? scopedSites[0].name : `${scopedSites.length} sites`)
+    : 'All sites';
+  const scopeShortNameUpper = scopeShortName.toUpperCase();
+  const scopeLongList  = filterActive ? scopedSites.map(s => s.name).join(', ') : '';
+
+  // When filtered, an item only "belongs to" a category section if it
+  // actually has a placement at one of the scoped sites — otherwise it's
+  // noise. totalQtyForItemInScope respects the scopeIds Set.
+  const itemBelongsInScope = (i) => !filterActive || totalQtyForItemInScope(i.id, scopeIds) > 0;
+
+  // Build the section list: real categories first (sorted so each parent
+  // is immediately followed by its sub-categories), then a virtual bucket
+  // for items without a categoryId. In scope mode, sections with zero
+  // in-scope items are dropped entirely — a "Power Tools: $0 in scope"
+  // row would just be visual noise.
+  //
+  // Each section is independent: a parent counts ONLY items directly
+  // attached to it, not items in its subs. The user sees sub sections
+  // separately, so rolling up would double-count visually.
+  const allCats = [...state.data.categories];
+  const tops = allCats.filter(c => !c.parentId).sort((a, b) => a.name.localeCompare(b.name));
+  const orderedCats = [];
+  tops.forEach(top => {
+    orderedCats.push(top);
+    allCats.filter(c => c.parentId === top.id)
+           .sort((a, b) => a.name.localeCompare(b.name))
+           .forEach(s => orderedCats.push(s));
+  });
+  // Orphans (parentId points at a missing category) — render at the end so
+  // they don't disappear from view.
+  allCats.filter(c => c.parentId && !allCats.find(p => p.id === c.parentId))
+         .sort((a, b) => a.name.localeCompare(b.name))
+         .forEach(c => orderedCats.push(c));
+
+  let sections = orderedCats.map(cat => {
+    const items = state.data.items.filter(i => i.categoryId === cat.id && itemBelongsInScope(i));
+    const displayName = cat.parentId ? (categoryPathName(cat.id) || cat.name) : cat.name;
+    return { id: cat.id, name: displayName, items, virtual: false, isSub: !!cat.parentId, ...sectionTotalsScoped(items, scopeIds) };
+  });
+  if (filterActive) sections = sections.filter(s => s.items.length > 0);
+
+  const uncategorized = state.data.items.filter(i => !i.categoryId && itemBelongsInScope(i));
+  if (uncategorized.length > 0) {
+    sections.push({ id: '_uncategorized', name: '— Uncategorized —', items: uncategorized, virtual: true, ...sectionTotalsScoped(uncategorized, scopeIds) });
+  }
+
+  const grandTotal = sections.reduce((s, sec) => s + sec.totalCost, 0);
+  const totalItems = sections.reduce((s, sec) => s + sec.items.length, 0);
+  const anyExpanded = sections.some(sec => state.expandedCategories.has(sec.id));
+
+  // The scope phrase is appended to the page subtitle and several card
+  // labels so the user never loses track of which mode the view is in.
+  const scopePhrase = filterActive
+    ? `<span style="color:var(--amber);" title="${escapeHtml(scopeLongList)}">Filtered to ${escapeHtml(scopeShortName)}</span>`
+    : 'All sites';
+
+  root.innerHTML = `
+    <div class="page-head">
+      <div>
+        <div class="page-title">CATEGORIES</div>
+        <div class="page-sub">// ${sections.length} categor${sections.length === 1 ? 'y' : 'ies'} · ${totalItems.toLocaleString()} item${totalItems === 1 ? '' : 's'} · ${fmt$(grandTotal)} inventory cost · ${scopePhrase}</div>
+      </div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:10px;">
+        <div class="page-sub" style="margin:0;color:var(--text-faint);">// Scope set via the WORKING SITE button in the topbar</div>
+        <div class="btn-row" style="margin:0;align-items:center;gap:8px;">
+          <!-- COLUMNS popover anchor (v49). Reuses .columns-anchor / .columns-panel
+               infrastructure but addresses the categoryItems column domain so
+               its prefs are stored / reordered independently of the Items tab. -->
+          <div class="columns-anchor">
+            <button class="btn ghost sm" onclick="toggleCategoryItemsColumnsPanel(event)" title="Reorder or hide columns" aria-haspopup="true" aria-expanded="${state.columnsPanelOpen && state.columnsDomain === 'categoryItems' ? 'true' : 'false'}">⋮⋮ COLUMNS</button>
+            <div id="categoryItemsColumnsPanel" class="columns-panel" style="${state.columnsPanelOpen && state.columnsDomain === 'categoryItems' ? '' : 'display:none;'}">${renderCategoryItemsColumnsPanel()}</div>
+          </div>
+          <button class="btn ghost sm" onclick="${anyExpanded ? 'collapseAllCategories()' : 'expandAllCategories()'}">${anyExpanded ? '↑ Collapse all' : '↓ Expand all'}</button>
+        </div>
+      </div>
+    </div>
+
+    ${sections.length === 0 ? `
+      <div class="card">
+        <div class="card-body">
+          <div class="empty">
+            <div class="empty-icon">∅</div>
+            <div class="empty-text">// ${filterActive ? `NO CATEGORIES WITH ITEMS IN ${escapeHtml(scopeShortNameUpper)}` : 'NO CATEGORIES DEFINED'}</div>
+            ${filterActive
+              ? `<div class="page-sub" style="margin-top:14px;">// Change the WORKING SITE in the topbar to widen scope, or add placements in ${escapeHtml(scopeShortName)} via Actions → Add.</div>`
+              : `<button class="btn" style="margin-top:18px;" onclick="goTab('lookups'); state.activeLookupTab='categories'; render();">+ Add a category</button>`}
+          </div>
+        </div>
+      </div>
+    ` : sections.map(sec => {
+      const expanded = state.expandedCategories.has(sec.id);
+      return `
+        <div class="cat-section ${expanded ? 'expanded' : ''} ${sec.virtual ? 'virtual' : ''}">
+          <button class="cat-header" type="button" onclick="toggleCategoryExpand('${sec.id}')" aria-expanded="${expanded}">
+            <span class="cat-chevron">${expanded ? '▼' : '▶'}</span>
+            <span class="cat-name">${escapeHtml(sec.name)}</span>
+            <span class="cat-count">${sec.items.length} item${sec.items.length === 1 ? '' : 's'} · ${sec.totalQty.toLocaleString()} unit${sec.totalQty === 1 ? '' : 's'}${filterActive ? ' in scope' : ''}</span>
+            <span class="cat-total">${fmt$(sec.totalCost)}</span>
+          </button>
+          ${expanded ? `
+            <div class="cat-body">
+              ${sec.items.length === 0 ? `
+                <div class="empty"><div class="empty-text">// NO ITEMS IN THIS CATEGORY${filterActive ? ` IN ${escapeHtml(scopeShortNameUpper)}` : ''}</div></div>
+              ` : (() => {
+                // Per-section table driven by the user's column prefs. Same
+                // effective columns are used for every section on the page,
+                // so reorder/hide in the COLUMNS popover affects all of them.
+                const cols = effectiveCategoryItemsCols();
+                // Columns whose values are typically right-aligned numerics.
+                // Driven by key so the alignment survives reordering. The
+                // remaining columns get default (left) alignment.
+                const rightAlign = new Set(['cost', 'listPrice', 'salesPrice', 'qty', 'lineCost']);
+                // v57 (Request 1): no trailing actions column. The Item # cell
+                // is now the click target for editing — see LIST_COLS.categoryItems.
+                const headHtml = cols.map(c => `<th${rightAlign.has(c.key) ? ' style="text-align:right;"' : ''}>${escapeHtml(c.label)}</th>`).join('');
+                const bodyHtml = sec.items.map(item => {
+                  const cells = cols.map(c => `<td${rightAlign.has(c.key) ? ' style="text-align:right;"' : ''}>${c.render(item)}</td>`).join('');
+                  return `<tr>${cells}</tr>`;
+                }).join('');
+                return `
+                  <div class="table-wrap">
+                    <table>
+                      <thead><tr>${headHtml}</tr></thead>
+                      <tbody>${bodyHtml}</tbody>
+                    </table>
+                  </div>`;
+              })()}
+            </div>
+          ` : ''}
+        </div>
+      `;
+    }).join('')}
+  `;
+}
+
+/* Helper: roll up totals for a section's items. Pulled out so the main
+   render stays readable and the same math is used for the grand total.
+   When scopeSiteId is provided, totals reflect only placements at that
+   site (used by the Categories tab's site-scope toggle). */
+function sectionTotals(items, scopeSiteId) {
+  let totalQty = 0, totalCost = 0;
+  for (const item of items) {
+    const q = totalQtyForItemAtSite(item.id, scopeSiteId);
+    totalQty  += q;
+    totalCost += (Number(item.cost) || 0) * q;
+  }
+  return { totalQty, totalCost };
+}
+
+function toggleCategoryExpand(catId) {
+  if (state.expandedCategories.has(catId)) state.expandedCategories.delete(catId);
+  else state.expandedCategories.add(catId);
+  render();
+}
+function expandAllCategories() {
+  state.data.categories.forEach(c => state.expandedCategories.add(c.id));
+  // Include the virtual uncategorized bucket if applicable
+  if (state.data.items.some(i => !i.categoryId)) state.expandedCategories.add('_uncategorized');
+  render();
+}
+function collapseAllCategories() {
+  state.expandedCategories.clear();
+  render();
+}
+
+/* ============ GENERIC LIST PAGE ============ */
+/* ============ CUSTOMER VIEW ============
+   Per-customer detail page reached by clicking VIEW on a row in the
+   Customers list. Shows customer info, then a filterable table of
+   tagged items with quantities + add/edit/remove controls.
+   ====================================================================*/
+function openCustomerView(customerId) {
+  state.activeCustomerView = customerId;
+  state.customerViewFilter = '';
+  state.activeTab = 'lookups';
+  state.activeLookupTab = 'customers';
+  render();
+}
+function closeCustomerView() {
+  state.activeCustomerView = null;
+  state.customerViewFilter = '';
+  render();
+}
+
+function renderCustomerView(root, customerId) {
+  const customer = state.data.customers.find(c => c.id === customerId);
+  // Guard: stale id (customer was deleted in another tab/session). Pop the
+  // user back to the list with a quiet notice rather than crashing.
+  if (!customer) {
+    state.activeCustomerView = null;
+    root.innerHTML = `<div class="main"><div class="notice warn">// Customer not found — they may have been deleted.</div><div class="btn-row"><button class="btn ghost" onclick="closeCustomerView()">← Back to Customers</button></div></div>`;
+    return;
+  }
+
+  // Build the table of tagged items, applying the filter to itemNumber + name.
+  const filter = (state.customerViewFilter || '').trim().toLowerCase();
+  const allTags = tagsForCustomer(customerId);
+  const rows = allTags.map(t => {
+    const item = state.data.items.find(i => i.id === t.itemId);
+    return { tag: t, item };
+  });
+  const filtered = filter
+    ? rows.filter(r => {
+        const num = (r.item && r.item.itemNumber || '').toLowerCase();
+        const nm  = (r.item && r.item.name || '').toLowerCase();
+        return num.includes(filter) || nm.includes(filter);
+      })
+    : rows;
+  // Sort: deleted-item rows last, then by itemNumber asc.
+  filtered.sort((a, b) => {
+    if (!a.item && b.item) return 1;
+    if (a.item && !b.item) return -1;
+    return (a.item?.itemNumber || '').localeCompare(b.item?.itemNumber || '');
+  });
+  const totalUnits = allTags.reduce((s, t) => s + (Number(t.quantity) || 0), 0);
+
+  // Identity card values — show only the fields the customer actually has.
+  const idRows = [];
+  if (customer.firstName || customer.lastName) idRows.push(['Contact', `${customer.firstName || ''} ${customer.lastName || ''}`.trim()]);
+  if (customer.company)    idRows.push(['Company',    customer.company]);
+  if (customer.department) idRows.push(['Department', customer.department]);
+  if (customer.phone)      idRows.push(['Phone',      customer.phone]);
+  if (customer.email)      idRows.push(['Email',      `<a href="mailto:${escapeHtml(customer.email)}">${escapeHtml(customer.email)}</a>`]);
+  if (customer.website)    idRows.push(['Website',    `<a href="${escapeHtml(customer.website)}" target="_blank" rel="noopener">${escapeHtml(customer.website)}</a>`]);
+
+  root.innerHTML = `
+    <div class="main">
+      <div class="page-head">
+        <div>
+          <div class="page-title">${escapeHtml(customer.customerName)}</div>
+          <div class="page-sub">// Customer view · ${allTags.length} tagged item${allTags.length === 1 ? '' : 's'} · ${totalUnits.toLocaleString()} total unit${totalUnits === 1 ? '' : 's'}</div>
+        </div>
+        <div class="btn-row" style="margin:0;">
+          <button class="btn ghost" onclick="closeCustomerView()">← Back to Customers</button>
+          <button class="btn ghost" onclick="openForm('customers', '${customer.id}')">EDIT CUSTOMER</button>
+        </div>
+      </div>
+
+      ${idRows.length === 0 ? '' : `
+        <div class="card">
+          <div class="card-head"><div class="card-title">Details</div></div>
+          <div class="card-body">
+            <div class="kv-grid">
+              ${idRows.map(([k, v]) => `<div class="kv-row"><div class="kv-key">${k}</div><div class="kv-val">${v}</div></div>`).join('')}
+            </div>
+          </div>
+        </div>
+      `}
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">Tagged Items</div>
+          <div class="btn-row" style="margin:0;">
+            <button class="btn sm" onclick="openTagForm('customer', '${customer.id}', null)" ${state.data.items.length === 0 ? 'disabled title="No items defined — add one under Items first"' : ''}>+ ADD TAG</button>
+            <button class="btn sm" onclick="openFulfillModal('${customer.id}')" ${allTags.length === 0 ? 'disabled title="No tagged items to remove from inventory"' : ''} title="Decrement inventory for the items tagged to this customer">↓ REMOVE FROM INVENTORY</button>
+          </div>
+        </div>
+        <div class="card-body">
+          ${allTags.length === 0
+            ? `<div class="empty"><div class="empty-icon">∅</div><div class="empty-text">// NO ITEMS TAGGED TO THIS CUSTOMER</div></div>`
+            : `
+              <div class="filter-bar">
+                <input class="search mono-input" placeholder="Filter by item # or name…" value="${escapeHtml(state.customerViewFilter)}" oninput="state.customerViewFilter=this.value; refreshCustomerTagsTable('${customer.id}');" />
+                <button id="clearCustomerFilter" class="btn ghost sm" onclick="state.customerViewFilter=''; render();" style="${filter ? '' : 'display:none'}">CLEAR</button>
+                <span class="page-sub" style="margin:0;" id="customerFilterCount">${filtered.length} OF ${allTags.length}</span>
+              </div>
+              <div id="customerTagsTable" class="table-wrap">${renderCustomerTagsTableInner(customer.id)}</div>
+            `}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* Inner table render — broken out so the search input can refresh just the
+   table contents (and the count) without re-rendering the whole page and
+   stealing the search input's focus. */
+function renderCustomerTagsTableInner(customerId) {
+  const filter = (state.customerViewFilter || '').trim().toLowerCase();
+  const tags = tagsForCustomer(customerId);
+  const rows = tags.map(t => ({ tag: t, item: state.data.items.find(i => i.id === t.itemId) }));
+  const filtered = filter
+    ? rows.filter(r => {
+        const num = (r.item && r.item.itemNumber || '').toLowerCase();
+        const nm  = (r.item && r.item.name || '').toLowerCase();
+        return num.includes(filter) || nm.includes(filter);
+      })
+    : rows;
+  filtered.sort((a, b) => {
+    if (!a.item && b.item) return 1;
+    if (a.item && !b.item) return -1;
+    return (a.item?.itemNumber || '').localeCompare(b.item?.itemNumber || '');
+  });
+  if (filtered.length === 0) {
+    return `<div class="empty"><div class="empty-icon">∅</div><div class="empty-text">// NO MATCHES</div></div>`;
+  }
+  return `
+    <table>
+      <thead><tr>
+        <th>Item #</th><th>Name</th><th style="text-align:right;">Tagged Qty</th><th></th>
+      </tr></thead>
+      <tbody>
+        ${filtered.map(({ tag, item }) => `
+          <tr>
+            <td>${item ? `<span class="id-tag">${escapeHtml(item.itemNumber)}</span>` : `<span class="badge red">— deleted item —</span>`}</td>
+            <td>${item && item.name ? escapeHtml(item.name) : '<span class="muted">—</span>'}</td>
+            <td style="text-align:right;"><span class="mono">${Number(tag.quantity).toLocaleString()}</span></td>
+            <td class="actions-cell">
+              ${item ? `<button class="btn ghost sm" onclick="openTagForm('customer', '${customerId}', '${tag.id}')">EDIT</button>` : ''}
+              <button class="btn ghost sm" onclick="confirmDeleteTag('${tag.id}', 'customer')">REMOVE</button>
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+function refreshCustomerTagsTable(customerId) {
+  const wrap = document.getElementById('customerTagsTable');
+  if (wrap) wrap.innerHTML = renderCustomerTagsTableInner(customerId);
+  const allTags = tagsForCustomer(customerId);
+  const filter = (state.customerViewFilter || '').trim().toLowerCase();
+  const filteredCount = filter
+    ? allTags.filter(t => {
+        const i = state.data.items.find(x => x.id === t.itemId);
+        const num = (i && i.itemNumber || '').toLowerCase();
+        const nm  = (i && i.name || '').toLowerCase();
+        return num.includes(filter) || nm.includes(filter);
+      }).length
+    : allTags.length;
+  const countEl = document.getElementById('customerFilterCount');
+  if (countEl) countEl.textContent = `${filteredCount} OF ${allTags.length}`;
+  const clearBtn = document.getElementById('clearCustomerFilter');
+  if (clearBtn) clearBtn.style.display = filter ? '' : 'none';
+}
+
+/* ============================================================
+   FULFILL FROM INVENTORY (customer view)
+   Bulk-decrement placements based on a customer's tagged items.
+   Reuses the single-item commitRemove for actual stock mutation
+   so action-log and audit entries match what the per-item
+   Actions tab would produce.
+
+   Tag lifecycle:
+     · removed qty == tagged qty  → tag deleted
+     · 0 < removed qty < tagged   → tag's quantity decremented
+     · removed qty == 0           → tag untouched (row skipped)
+   ============================================================ */
+
+/* Returns sites that hold at least one of the customer's tagged items.
+   Sites with no stock for ANY tag are hidden — the user can't usefully
+   fulfill from there. */
+function fulfillEligibleSites(customerId) {
+  const tagItemIds = new Set(tagsForCustomer(customerId).map(t => t.itemId));
+  if (tagItemIds.size === 0) return [];
+  const eligibleSiteIds = new Set();
+  state.data.placements.forEach(p => {
+    if (tagItemIds.has(p.itemId)) eligibleSiteIds.add(p.siteId);
+  });
+  return state.data.sites
+    .filter(s => eligibleSiteIds.has(s.id))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+/* Locations within the chosen site that hold at least one tagged item. */
+function fulfillEligibleLocations(customerId, siteId) {
+  if (!siteId) return [];
+  const tagItemIds = new Set(tagsForCustomer(customerId).map(t => t.itemId));
+  if (tagItemIds.size === 0) return [];
+  const eligibleLocIds = new Set();
+  state.data.placements.forEach(p => {
+    if (tagItemIds.has(p.itemId) && p.siteId === siteId && p.locationId) eligibleLocIds.add(p.locationId);
+  });
+  return state.data.locations
+    .filter(l => l.siteId === siteId && eligibleLocIds.has(l.id))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function openFulfillModal(customerId) {
+  const customer = state.data.customers.find(c => c.id === customerId);
+  if (!customer) return;
+  const tags = tagsForCustomer(customerId);
+  if (tags.length === 0) { toast('No tagged items to remove from inventory', 'error'); return; }
+  if (state.data.sites.length === 0 || state.data.locations.length === 0) {
+    toast('Define at least one site and one location first', 'error');
+    return;
+  }
+  state.fulfillForm = {
+    customerId,
+    siteId: '',
+    locationId: '',
+    notes: '',
+    qtyByItem: {} // populated when location is picked (defaults computed there)
+  };
+  renderFulfillModal();
+}
+function closeFulfillForm() {
+  state.fulfillForm = null;
+  // Customer view re-renders via render() so the (possibly updated) tag
+  // list is reflected in the page.
+  render();
+}
+
+/* When the user picks a (site, location), pre-populate the per-item qty
+   inputs to min(tagged qty, available at source). Items with zero stock
+   at the chosen source land at 0 (skipped on submit). The user can
+   override any value. Any prior qtyByItem entries are reset — switching
+   location is an explicit signal to start fresh, since availabilities
+   differ. */
+function onFulfillSourceChanged() {
+  const f = state.fulfillForm;
+  if (!f.siteId || !f.locationId) { f.qtyByItem = {}; renderFulfillModal(); return; }
+  const tags = tagsForCustomer(f.customerId);
+  const defaults = {};
+  tags.forEach(t => {
+    const item = state.data.items.find(i => i.id === t.itemId);
+    if (!item) return; // skip deleted items
+    const available = batchAvailableAt(t.itemId, f.siteId, f.locationId);
+    const tagged = Number(t.quantity) || 0;
+    const def = Math.min(tagged, available);
+    defaults[t.itemId] = String(def > 0 ? def : 0);
+  });
+  f.qtyByItem = defaults;
+  renderFulfillModal();
+}
+
+function renderFulfillModal() {
+  const f = state.fulfillForm;
+  if (!f) return;
+  const customer = state.data.customers.find(c => c.id === f.customerId);
+  if (!customer) { closeFulfillForm(); return; }
+  const tags = tagsForCustomer(f.customerId);
+  const sites = fulfillEligibleSites(f.customerId);
+  const locs  = fulfillEligibleLocations(f.customerId, f.siteId);
+  const sourceLocked = !!(f.siteId && f.locationId);
+
+  document.getElementById('modalHost').innerHTML = `
+    <div class="modal-overlay" onclick="if(event.target===this) closeFulfillForm()">
+      <div class="modal lg">
+        <div class="modal-head">
+          <div class="modal-title-row">
+            <div class="modal-title">REMOVE FROM INVENTORY</div>
+            <div class="modal-sub">// Decrement stock for items tagged to <strong>${escapeHtml(customer.customerName)}</strong> · fully-fulfilled tags are removed</div>
+          </div>
+          <button class="close-btn" onclick="closeFulfillForm()">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="batch-modal-summary">// ${tags.length} tagged item${tags.length === 1 ? '' : 's'} in scope · Operator: ${escapeHtml(state.user.firstName + ' ' + state.user.lastName)}</div>
+          <form id="fulfillForm" onsubmit="submitFulfillForm(event)">
+            <div class="form-grid">
+              <div class="field"><div class="field-label-row"><label>Source Site</label><span class="req-badge">REQUIRED</span></div>
+                <select name="siteId" onchange="state.fulfillForm.siteId=this.value; state.fulfillForm.locationId=''; state.fulfillForm.qtyByItem={}; renderFulfillModal();">
+                  <option value="">${sites.length ? '— select a site —' : '— no sites have stock for these items —'}</option>
+                  ${sites.map(s => `<option value="${s.id}" ${f.siteId === s.id ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}
+                </select>
+              </div>
+              <div class="field"><div class="field-label-row"><label>Source Location</label><span class="req-badge">REQUIRED</span></div>
+                <select name="locationId" onchange="state.fulfillForm.locationId=this.value; onFulfillSourceChanged();" ${f.siteId ? '' : 'disabled'}>
+                  <option value="">${f.siteId ? (locs.length ? '— select a location —' : '— no eligible locations at this site —') : '— select a site first —'}</option>
+                  ${locs.map(l => `<option value="${l.id}" ${f.locationId === l.id ? 'selected' : ''}>${escapeHtml(l.name)}</option>`).join('')}
+                </select>
+              </div>
+            </div>
+
+            <table class="batch-items-table">
+              <thead><tr>
+                <th>Item #</th>
+                <th>Name</th>
+                <th style="text-align:right;">Tagged</th>
+                <th style="text-align:right;">Available</th>
+                <th style="text-align:right;">Qty to remove</th>
+              </tr></thead>
+              <tbody>
+                ${tags.map(t => {
+                  const item = state.data.items.find(i => i.id === t.itemId);
+                  const deletedItem = !item;
+                  const available = sourceLocked && item ? batchAvailableAt(t.itemId, f.siteId, f.locationId) : null;
+                  const skipped = deletedItem || (sourceLocked && (available === 0 || available == null));
+                  const rawQty = f.qtyByItem[t.itemId] != null ? f.qtyByItem[t.itemId] : '';
+                  const cap = sourceLocked && item ? available : '';
+                  return `
+                    <tr class="${skipped ? 'batch-row-skipped' : ''}">
+                      <td>${item ? `<span class="id-tag">${escapeHtml(item.itemNumber)}</span>` : `<span class="badge red">— deleted —</span>`}</td>
+                      <td>${item ? (item.name ? escapeHtml(item.name) : '<span class="muted">—</span>') : '<span class="muted">—</span>'}</td>
+                      <td style="text-align:right;" class="mono">${Number(t.quantity).toLocaleString()}</td>
+                      <td style="text-align:right;" class="mono">${
+                        deletedItem ? '<span class="batch-row-warning">n/a</span>' :
+                        !sourceLocked ? '<span class="muted">—</span>' :
+                        available === 0 ? '<span class="batch-row-warning">0 · skip</span>' :
+                        Number(available).toLocaleString()
+                      }</td>
+                      <td style="text-align:right;">
+                        <input type="number" class="qty-input mono-input" min="0" step="1" max="${cap}" value="${escapeHtml(rawQty)}" ${skipped ? 'disabled' : ''} placeholder="0" oninput="state.fulfillForm.qtyByItem['${t.itemId}']=this.value;" />
+                      </td>
+                    </tr>`;
+                }).join('')}
+              </tbody>
+            </table>
+
+            <div class="field full" style="margin-top:14px;">
+              <div class="field-label-row"><label>Notes</label><span class="opt-badge">OPTIONAL</span></div>
+              <input type="text" name="notes" value="${escapeHtml(f.notes || '')}" placeholder="e.g. PO #4521, ship date, fulfilled by" oninput="state.fulfillForm.notes=this.value;" />
+            </div>
+
+            <div class="field-error" id="fulfillFormError" style="margin-top:10px; min-height:18px;"></div>
+          </form>
+        </div>
+        <div class="modal-foot">
+          <div class="modal-foot-info">// Each item is removed via the same path as a single-item REMOVE action · audit-logged</div>
+          <div class="modal-foot-buttons">
+            <button class="btn ghost" onclick="closeFulfillForm()">CANCEL</button>
+            <button class="btn" onclick="document.getElementById('fulfillForm').requestSubmit()">REMOVE FROM INVENTORY →</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function submitFulfillForm(e) {
+  e.preventDefault();
+  const f = state.fulfillForm;
+  const errEl = document.getElementById('fulfillFormError');
+  const setError = msg => { if (errEl) errEl.textContent = msg; };
+
+  if (!f.siteId || !f.locationId) { setError('Pick a source site and location'); return; }
+  const customer = state.data.customers.find(c => c.id === f.customerId);
+  if (!customer) { setError('Customer no longer exists'); return; }
+  const tags = tagsForCustomer(f.customerId);
+
+  // Pre-validate every row before committing anything. Atomicity matters
+  // more here than in the items-list batch actions: the user is fulfilling
+  // a customer order, and a partial-success mid-batch is a worse outcome
+  // than a clean error message and retry.
+  const rows = [];
+  for (const tag of tags) {
+    const item = state.data.items.find(i => i.id === tag.itemId);
+    if (!item) continue; // skip deleted items silently
+    const raw = f.qtyByItem[tag.itemId];
+    const qty = raw ? parseInt(raw, 10) : 0;
+    if (isNaN(qty) || qty < 0) { setError(`${item.itemNumber}: quantity must be a whole number ≥ 0`); return; }
+    if (qty === 0) continue; // user chose to skip this row
+    const available = batchAvailableAt(tag.itemId, f.siteId, f.locationId);
+    if (available == null || available === 0) {
+      setError(`${item.itemNumber}: no stock at the chosen source · set qty to 0 to skip`);
+      return;
+    }
+    if (qty > available) { setError(`${item.itemNumber}: requested ${qty}, only ${available} available at source`); return; }
+    if (qty > Number(tag.quantity)) { setError(`${item.itemNumber}: requested ${qty} exceeds tagged ${tag.quantity}`); return; }
+    rows.push({ tag, item, qty });
+  }
+  if (rows.length === 0) { setError('Enter a quantity > 0 for at least one item'); return; }
+
+  // Commit phase. Each row: decrement placement (commitRemove) + update or
+  // delete the tag. Per-row try/catch so a late failure doesn't black-hole
+  // the earlier rows' success.
+  let ok = 0, failed = 0; const errors = [];
+  for (const { tag, item, qty } of rows) {
+    try {
+      await commitRemove(item, f.siteId, f.locationId, qty, f.notes || 'Customer fulfillment');
+      // Update or delete the tag based on remaining qty.
+      const remaining = Number(tag.quantity) - qty;
+      if (remaining <= 0) {
+        await deleteTag(tag.id);
+      } else {
+        await upsertTag(item.id, f.customerId, remaining);
+      }
+      ok++;
+    } catch (err) {
+      failed++;
+      errors.push(`${item.itemNumber}: ${err.message}`);
+    }
+  }
+
+  closeFulfillForm();
+  if (failed === 0) {
+    toast(`Removed ${ok} item${ok === 1 ? '' : 's'} from inventory`, 'success');
+  } else {
+    toast(`${ok} succeeded · ${failed} failed (${errors[0]}${failed > 1 ? ` and ${failed - 1} more` : ''})`, 'error');
+  }
+}
+
+function renderListPage(root, type) {
+  const cfg = ENTITIES[type];
+  const records = state.data[type];
+  const search = state.search[type] || '';
+  const isItems = type === 'items';
+  // v50 (Item 2): if the user hasn't manually overridden the items site
+  // dropdown during this visit, sync it to the global working-site. Runs
+  // BEFORE computeFilteredList so the filter applies the synced value
+  // on the same render pass.
+  if (isItems) syncItemsSiteFromWorking();
+  const f = isItems ? state.filters.items : null;
+  const { filtered } = computeFilteredList(type);
+
+  const pageDescriptions = {
+    items: 'Master items · only item number is required (everything else is optional)',
+    placements: 'Item placements · site, location, and quantity per item · multiple per item allowed, duplicates never flagged',
+    sites: 'Physical site records · only site name is required',
+    locations: 'Locations within sites · both site and location name are required',
+    categories: 'Category records · only category name is required',
+    customers: 'Customer accounts · only customer name is required',
+    users: 'System users · first name, last name, email, and title are required'
+  };
+
+  // Pre-conditions
+  let blocker = null;
+  if (type === 'placements' && (state.data.items.length === 0 || state.data.sites.length === 0)) {
+    blocker = `<div class="notice warn">// <strong>SETUP NEEDED</strong> — Placements link an item to a site. Add at least one item and one site first.</div>`;
+  }
+  if (type === 'locations' && state.data.sites.length === 0) {
+    blocker = `<div class="notice warn">// <strong>NO SITES DEFINED</strong> — Locations belong to a site. Create at least one site under <strong>Lookups → Sites</strong> first.</div>`;
+  }
+
+  const hasFilters = search || (isItems && (f.category || f.site));
+
+  root.innerHTML = `
+    <div class="page-head">
+      <div>
+        <div class="page-title">${cfg.label.toUpperCase()}</div>
+        <div class="page-sub">// ${pageDescriptions[type]}</div>
+      </div>
+      <div class="btn-row" style="margin:0;">
+        ${type === 'items'
+          ? `<span class="page-sub" style="margin:0;">// Use the <strong>Add New Inventory Item</strong> tab above to add an item</span>`
+          : (type === 'users' && !isLogoAdmin())
+            ? `<span class="page-sub" style="margin:0;">// Only the owner profile can add or remove users</span>`
+            : `<button class="btn" onclick="openForm('${type}')" ${blocker ? 'disabled' : ''}>+ Add ${cfg.singular}</button>`}
+      </div>
+    </div>
+
+    ${blocker || ''}
+
+    <div class="card">
+      <div class="card-body">
+        ${records.length > 0 ? `
+          <div class="filter-bar">
+            <input class="search mono-input" placeholder="Search ${cfg.label.toLowerCase()}…" value="${escapeHtml(search)}" oninput="state.search['${type}']=this.value; refreshListTable('${type}');" onfocus="onSearchInputFocus('${type}')" onblur="onSearchInputBlur()" />
+            <!-- v61 (Request 2): the inline 📷 SCAN button was removed.
+                 Tapping the search input now reveals a floating "SCAN
+                 BARCODE" bar pinned above the on-screen keyboard — see
+                 onSearchInputFocus / showSearchScanFloater. Hardware-
+                 keyboard barcode scanners that type into the input keep
+                 working unchanged. -->
+            ${isItems ? `
+              <select id="itemsCategoryFilter" onchange="state.filters.items.category=this.value; refreshListTable('${type}');">
+                ${itemsCategoryFilterOptionsHTML()}
+              </select>
+              <select id="itemsSiteFilter" onchange="onItemsSiteFilterChange(this.value)">
+                <!-- v50 (Item 2): dropdown defaults to whatever the topbar
+                     WORKING SITE button has selected. The sync runs above
+                     (before innerHTML) so f.site already reflects the
+                     working-site at render time. The "Working Sites (N)"
+                     option only appears when 2+ sites are in the working
+                     scope — for 0 or 1 sites the "All Sites" or the
+                     individual site option does the job. -->
+                <option value="" ${f.site === '' ? 'selected' : ''}>All Sites</option>
+                ${(() => {
+                  const scopeIds = workingSiteSetPruned();
+                  return scopeIds.size >= 2
+                    ? `<option value="__working__" ${f.site === '__working__' ? 'selected' : ''}>Working Sites (${scopeIds.size})</option>`
+                    : '';
+                })()}
+                ${state.data.sites.map(s => `<option value="${s.id}" ${f.site===s.id?'selected':''}>${escapeHtml(s.name)}</option>`).join('')}
+              </select>
+            ` : ''}
+            <button id="clearBtn_${type}" class="btn ghost sm" onclick="clearFilters('${type}')" style="${hasFilters ? '' : 'display:none'}">CLEAR</button>
+            <span id="filterCount_${type}" class="page-sub" style="margin:0;">${filtered.length} OF ${records.length}</span>
+            ${isItems ? `
+              <div class="columns-anchor">
+                <button class="btn ghost sm" onclick="toggleColumnsPanel(event)" title="Reorder or hide columns" aria-haspopup="true" aria-expanded="${state.columnsPanelOpen && state.columnsDomain === 'items' ? 'true' : 'false'}">⋮⋮ COLUMNS</button>
+                <div id="columnsPanel" class="columns-panel" style="${state.columnsPanelOpen && state.columnsDomain === 'items' ? '' : 'display:none;'}">${renderColumnsPanel()}</div>
+              </div>
+            ` : ''}
+          </div>
+        ` : ''}
+        ${isItems ? `<div id="itemsSelectionBar">${renderItemsSelectionBar()}</div>` : ''}
+        <div id="tableWrap_${type}" class="table-wrap">
+          ${renderListTableInner(type)}
+        </div>
+      </div>
+    </div>`;
+}
+
+/* Computes the filtered record set for a given list type.
+   Substring matching: every searchable field is lowercased and tested
+   with .includes(query), so typing any contiguous run of characters
+   matches anywhere it appears in any field. */
+function computeFilteredList(type) {
+  const cfg = ENTITIES[type];
+  const records = state.data[type];
+  const search = state.search[type] || '';
+  const isItems = type === 'items';
+  const f = isItems ? state.filters.items : null;
+
+  let filtered = records;
+  // v50 (Item 5): non-owner profiles can only see (and therefore edit)
+  // their own user record under Manage → Users. isLogoAdmin() is the
+  // existing "is Jake Hardin" gate — reused here as a general owner
+  // check. If the current user is somehow not in the records list
+  // (shouldn't happen but defensive), they see nothing.
+  if (type === 'users' && !isLogoAdmin()) {
+    filtered = records.filter(r => state.user && r.id === state.user.id);
+  }
+  if (search) {
+    const q = search.toLowerCase();
+    filtered = filtered.filter(r => {
+      return cfg.fields.some(field => {
+        const v = r[field.key];
+        if (v == null) return false;
+        if (field.type === 'select-site')     { const s = state.data.sites.find(x=>x.id===v);      return s && s.name.toLowerCase().includes(q); }
+        if (field.type === 'select-location') { const l = state.data.locations.find(x=>x.id===v);  return l && l.name.toLowerCase().includes(q); }
+        if (field.type === 'select-category') { const c = state.data.categories.find(x=>x.id===v); return c && c.name.toLowerCase().includes(q); }
+        if (field.type === 'select-item')     { const i = state.data.items.find(x=>x.id===v);      return i && (i.itemNumber.toLowerCase().includes(q) || (i.name||'').toLowerCase().includes(q)); }
+        if (field.type === 'image') return false;
+        return String(v).toLowerCase().includes(q);
+      });
+    });
+  }
+  if (isItems) {
+    if (f.category) {
+      // Inclusive match: selecting a parent category also pulls in items
+      // placed under any of its sub-categories. Selecting a sub-category
+      // matches only items directly attached to that sub.
+      const matchSet = categoryIdAndDescendants(f.category);
+      filtered = filtered.filter(i => matchSet.has(i.categoryId));
+    }
+    if (f.site) {
+      // v50 (Item 2): the dropdown carries either:
+      //   · a real siteId            → filter to placements at that site
+      //   · the literal '__working__' → filter to placements at any site
+      //                                in the working-site Set
+      // Empty string ('') means "All Sites" — no filter applied.
+      let itemIdsInScope;
+      if (f.site === '__working__') {
+        const scopeIds = workingSiteSetPruned();
+        itemIdsInScope = new Set(state.data.placements.filter(p => scopeIds.has(p.siteId)).map(p => p.itemId));
+      } else {
+        itemIdsInScope = new Set(state.data.placements.filter(p => p.siteId === f.site).map(p => p.itemId));
+      }
+      // v62 (Request 2): if the user clicked STATUS to toggle inclusion
+      // of out-of-stock items in their scope's categories, augment the
+      // visible set. Definition of OOS used here: zero placements
+      // anywhere in the system (not just zero at the working site) —
+      // that's the unambiguous "the item exists but has no stock" case.
+      // Matching category set comes from items currently in scope so
+      // unrelated OOS items (e.g. office supplies when scoped to a
+      // tools warehouse) stay hidden.
+      if (f.includeOosInScopeCategories) {
+        const scopedCategoryIds = new Set();
+        for (const it of filtered) {
+          if (itemIdsInScope.has(it.id) && it.categoryId) scopedCategoryIds.add(it.categoryId);
+        }
+        if (scopedCategoryIds.size > 0) {
+          const itemIdsWithAnyPlacement = new Set(state.data.placements.map(p => p.itemId));
+          for (const it of filtered) {
+            if (itemIdsInScope.has(it.id)) continue; // already shown
+            if (itemIdsWithAnyPlacement.has(it.id)) continue; // has stock somewhere — not OOS
+            if (!it.categoryId || !scopedCategoryIds.has(it.categoryId)) continue;
+            itemIdsInScope.add(it.id);
+          }
+        }
+      }
+      filtered = filtered.filter(i => itemIdsInScope.has(i.id));
+    }
+  }
+  return { filtered, records };
+}
+
+/* Returns the categories that have at least one item placed at the given
+   site. With no site filter (siteId === ''), returns all categories. The
+   chain is: placements at site → items at site → distinct categoryIds.
+   Items without a categoryId don't contribute to this list (they're
+   uncategorized and can only be reached via the "All Categories" option).
+   When a sub-category is "available", its parent is also added so the user
+   can filter inclusively at the parent level. */
+function categoriesAvailableForSite(siteId) {
+  if (!siteId) return state.data.categories;
+  const itemIdsAtSite = new Set(
+    state.data.placements
+      .filter(p => p.siteId === siteId)
+      .map(p => p.itemId)
+  );
+  const categoryIdsAtSite = new Set();
+  state.data.items.forEach(i => {
+    if (itemIdsAtSite.has(i.id) && i.categoryId) categoryIdsAtSite.add(i.categoryId);
+  });
+  // Surface the parent of any in-scope sub so it shows up as a filter option.
+  Array.from(categoryIdsAtSite).forEach(id => {
+    const c = state.data.categories.find(x => x.id === id);
+    if (c && c.parentId) categoryIdsAtSite.add(c.parentId);
+  });
+  return state.data.categories.filter(c => categoryIdsAtSite.has(c.id));
+}
+
+/* Renders the <option> list for the items category filter, narrowed to the
+   currently selected site. Used by both the initial render and the in-place
+   refresh that runs when the site filter changes. Top-level categories come
+   first alphabetically, each immediately followed by its sub-categories
+   (indented with "↳"). Orphans render at the end so they're still reachable. */
+function itemsCategoryFilterOptionsHTML() {
+  const f = state.filters.items;
+  // v50 (Item 2): the __working__ sentinel isn't a real siteId, so passing
+  // it to categoriesAvailableForSite would return nothing. Treat it as
+  // "any site" for category-dropdown purposes — slightly less precise
+  // than enumerating categories within just the working sites, but it
+  // never hides categories from the user when narrowing scope.
+  const siteForCats = f.site === '__working__' ? '' : f.site;
+  const cats = categoriesAvailableForSite(siteForCats);
+  const inScope = new Set(cats.map(c => c.id));
+  const tops = cats.filter(c => !c.parentId).sort((a,b) => a.name.localeCompare(b.name));
+  const orphans = cats.filter(c => c.parentId && !state.data.categories.find(p => p.id === c.parentId && inScope.has(p.id)));
+  let opts = `<option value="">All Categories</option>`;
+  tops.forEach(top => {
+    opts += `<option value="${top.id}" ${f.category === top.id ? 'selected' : ''}>${escapeHtml(top.name)}</option>`;
+    cats.filter(c => c.parentId === top.id)
+        .sort((a,b) => a.name.localeCompare(b.name))
+        .forEach(s => {
+          opts += `<option value="${s.id}" ${f.category === s.id ? 'selected' : ''}>\u00a0\u00a0\u00a0\u00a0↳ ${escapeHtml(s.name)}</option>`;
+        });
+  });
+  orphans.forEach(o => {
+    opts += `<option value="${o.id}" ${f.category === o.id ? 'selected' : ''}>${escapeHtml(o.name)} (orphaned)</option>`;
+  });
+  return opts;
+}
+
+/* Site-filter onchange handler. Updates the site filter, drops the category
+   filter if it points at a category not present at the new site (otherwise
+   the dropdown would show an out-of-list selection or the user would get
+   silently empty results), rebuilds the category dropdown's options in
+   place, and refreshes the table.
+
+   v50 (Item 2): also flips the _itemsSiteUserOverride flag so the auto-
+   sync-from-working-site logic in renderListPage doesn't immediately
+   undo the user's explicit selection on the next refresh. */
+function onItemsSiteFilterChange(value) {
+  state._itemsSiteUserOverride = true;
+  state.filters.items.site = value;
+  // When the user picks the special "Working sites" option, the dropdown
+  // value is the literal "__working__" sentinel — that flows through to
+  // computeFilteredList which treats it as a Set filter. Category dropdown
+  // rebuild still uses the literal value for its lookups.
+  const lookupSite = value === '__working__' ? '' : value;
+  const available = categoriesAvailableForSite(lookupSite);
+  if (state.filters.items.category && !available.some(c => c.id === state.filters.items.category)) {
+    state.filters.items.category = '';
+  }
+  const sel = document.getElementById('itemsCategoryFilter');
+  if (sel) sel.innerHTML = itemsCategoryFilterOptionsHTML();
+  refreshListTable('items');
+}
+
+/* v50 (Item 2): syncs state.filters.items.site to the global working-site
+   selection. Called once per visit to the Items tab (before the dropdown
+   renders) so the dropdown's default reflects what the user picked in the
+   topbar WORKING SITE button.
+
+   Sync rules:
+     · working-site empty (= all sites)  → items.site = ''  → "All Sites"
+     · working-site = 1 site             → items.site = siteId → that site
+     · working-site = N≥2 sites          → items.site = '__working__' → "Working Sites (N)"
+
+   Skipped entirely if the user has manually changed the dropdown during
+   this visit (state._itemsSiteUserOverride). That flag resets when the
+   user leaves the Items tab or changes the working-site selection. */
+/* v62 (Request 2): toggle whether OOS items in scoped categories are
+   surfaced on the Items tab. Bound to the STATUS column header click
+   (header is only clickable when a working-site filter is active —
+   without scope the toggle has no effect since all items are visible
+   anyway). */
+function toggleIncludeOosInScopeCategories() {
+  state.filters.items.includeOosInScopeCategories = !state.filters.items.includeOosInScopeCategories;
+  refreshListTable('items');
+}
+
+function syncItemsSiteFromWorking() {
+  if (state._itemsSiteUserOverride) return;
+  const scopeIds = workingSiteSetPruned();
+  if (scopeIds.size === 0) state.filters.items.site = '';
+  else if (scopeIds.size === 1) state.filters.items.site = Array.from(scopeIds)[0];
+  else state.filters.items.site = '__working__';
+}
+
+/* Renders just the inside of the table-wrap div — the table itself
+   (or an empty state). Called by refreshListTable on filter changes. */
+function renderListTableInner(type) {
+  const cfg = ENTITIES[type];
+  // For items, the user can reorder columns and hide some via the COLUMNS
+  // popover — so the active set is computed from prefs. Every other entity
+  // uses its static LIST_COLS array as-is.
+  const cols = (type === 'items') ? effectiveItemsCols() : LIST_COLS[type];
+  const { filtered, records } = computeFilteredList(type);
+
+  if (records.length === 0) return renderEmptyState(type);
+  if (filtered.length === 0) return `<div class="empty"><div class="empty-icon">∅</div><div class="empty-text">// NO RECORDS MATCH YOUR FILTERS</div></div>`;
+
+  // Items list gets a leading checkbox column for batch selection. The header
+  // checkbox is a tri-state-ish toggle: if every visible item is selected,
+  // it appears checked and clicking deselects all visible; otherwise it
+  // selects all visible (without touching off-screen selected items).
+  const showCheckboxes = type === 'items';
+  const visibleIds = filtered.map(r => r.id);
+  const allVisibleSelected = showCheckboxes && visibleIds.length > 0 && visibleIds.every(id => state.selectedItemIds.has(id));
+
+  // v60 (Request 3): timestamps next to items are hidden on mobile via
+  // .ts-cell. Scoped to type === 'items' so Users/Customers/Sites tables
+  // (which also use renderListTableInner) keep their timestamps visible.
+  const tsClass = type === 'items' ? 'ts-cell ' : '';
+
+  // v62 (Request 2): the STATUS column header is a toggle button on the
+  // Items tab when a working-site filter is active. Click it to surface
+  // OOS items in the working-site's categories. We compute the header
+  // markup per-column so the rest of the columns get the simple <th>label</th>.
+  const itemsSiteFilterActive = type === 'items' && state.filters.items && !!state.filters.items.site;
+  const oosFlagOn = type === 'items' && state.filters.items && state.filters.items.includeOosInScopeCategories;
+  const renderHeaderCell = (c) => {
+    if (type === 'items' && c.key === 'status' && itemsSiteFilterActive) {
+      const cls = `status-toggle-th${oosFlagOn ? ' is-active' : ''}`;
+      const title = oosFlagOn
+        ? 'Click to stop showing OOS items from this scope\'s categories'
+        : 'Click to also show out-of-stock items in this scope\'s categories';
+      return `<th class="${cls}" onclick="toggleIncludeOosInScopeCategories()" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleIncludeOosInScopeCategories();}" title="${escapeHtml(title)}">${c.label}${oosFlagOn ? ' <span class="status-toggle-pip">+OOS</span>' : ' <span class="status-toggle-pip muted">⌄</span>'}</th>`;
+    }
+    return `<th>${c.label}</th>`;
+  };
+
+  return `
+    <table>
+      <thead><tr>
+        ${showCheckboxes ? `<th style="width:36px;padding-right:0;"><input type="checkbox" class="row-check" aria-label="Select all visible items" ${allVisibleSelected ? 'checked' : ''} onclick="toggleSelectAllVisibleItems()" /></th>` : ''}
+        ${cols.map(renderHeaderCell).join('')}
+        <th${tsClass ? ` class="${tsClass.trim()}"` : ''}></th><th></th>
+      </tr></thead>
+      <tbody>
+        ${filtered.map(r => `
+          <tr ${showCheckboxes ? `data-item-id="${r.id}"` : ''} ${showCheckboxes && state.selectedItemIds.has(r.id) ? 'class="row-selected"' : ''}>
+            ${showCheckboxes ? `<td style="padding-right:0;"><input type="checkbox" class="row-check" aria-label="Select item" ${state.selectedItemIds.has(r.id) ? 'checked' : ''} onclick="toggleItemSelection('${r.id}')" /></td>` : ''}
+            ${cols.map(c => `<td>${c.render(r)}</td>`).join('')}
+            <td class="${tsClass}muted mono" style="font-size:10px; white-space:nowrap;">${r.lastModifiedAt ? fmtDate(r.lastModifiedAt) : ''}</td>
+            <td class="actions-cell">
+              ${type === 'users' ? `<button class="btn ghost sm" onclick="openPasswordReset('${r.id}')" title="Reset this user's password">RESET PW</button>` : ''}
+              ${type === 'customers' ? `<button class="btn ghost sm" onclick="openCustomerView('${r.id}')" title="View tagged items">VIEW</button>` : ''}
+              <!-- v57 (Request 1): items no longer get a per-row EDIT button —
+                   the item # tag is now the click target. Every other type
+                   still uses the explicit EDIT button. -->
+              ${type === 'items' ? '' : `<button class="btn ghost sm" onclick="openForm('${type}', '${r.id}')">EDIT</button>`}
+              <!-- v57 (Request 2): items also lose the per-row DEL button —
+                   deletion goes through the selection bar's DELETE action
+                   so we can enforce the "no placements" gate on bulk
+                   selections. Non-owner users still can't DEL (existing
+                   v50 rule) and items NEVER get DEL here either. -->
+              ${type === 'items' || (type === 'users' && !isLogoAdmin()) ? '' : `<button class="btn ghost sm" onclick="confirmDelete('${type}', '${r.id}')">DEL</button>`}
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+/* Updates only the table contents and the count/clear-button visibility,
+   leaving the search input element untouched so typing focus and cursor
+   position are preserved across keystrokes. */
+function refreshListTable(type) {
+  const wrap = document.getElementById('tableWrap_' + type);
+  if (wrap) wrap.innerHTML = renderListTableInner(type);
+
+  const { filtered, records } = computeFilteredList(type);
+  const countEl = document.getElementById('filterCount_' + type);
+  if (countEl) countEl.textContent = `${filtered.length} OF ${records.length}`;
+
+  const search = state.search[type] || '';
+  const isItems = type === 'items';
+  const hasFilters = search || (isItems && (state.filters.items.category || state.filters.items.site));
+  const clearBtn = document.getElementById('clearBtn_' + type);
+  if (clearBtn) clearBtn.style.display = hasFilters ? '' : 'none';
+
+  // Items: also refresh the selection bar so the visible-count adjusts when
+  // search/category/site filters change (selected-but-now-hidden items still
+  // count toward the total, but the "select-all-visible" header behaviour
+  // depends on which items are currently visible).
+  if (isItems) refreshItemsSelectionBar();
+}
+
+/* ---------- ITEMS LIST SELECTION ----------
+   Selection state is a Set of item ids on state.selectedItemIds. The Set is
+   session-only — cleared on every navigation away from the Items tab (see
+   render() guard). Selected items that are subsequently deleted will be
+   pruned by selectedItemsCurrent(), so downstream batch code never sees
+   stale ids. */
+function selectedItemsCurrent() {
+  // Returns the live item records that are still selected (filters out any
+  // ids whose item has since been deleted from state.data.items).
+  const ids = state.selectedItemIds;
+  if (!ids || ids.size === 0) return [];
+  const byId = new Map(state.data.items.map(i => [i.id, i]));
+  const out = [];
+  ids.forEach(id => { if (byId.has(id)) out.push(byId.get(id)); });
+  return out;
+}
+
+/* v57 (Request 2): split the live selection into two buckets — items
+   that have at least one placement (NOT deletable) vs items with no
+   placement (deletable). Used to gate the selection-bar DELETE button
+   and to populate the "couldn't delete because…" diagnostic when the
+   user tries to delete a mixed selection. */
+function _selectedItemsPlacementsBuckets() {
+  const sel = selectedItemsCurrent();
+  if (sel.length === 0) return { withPlacements: [], withoutPlacements: [] };
+  const itemIdsWithPlacements = new Set(state.data.placements.map(p => p.itemId));
+  const withPlacements = [];
+  const withoutPlacements = [];
+  for (const it of sel) {
+    if (itemIdsWithPlacements.has(it.id)) withPlacements.push(it);
+    else withoutPlacements.push(it);
+  }
+  return { withPlacements, withoutPlacements };
+}
+function selectedItemsWithoutPlacements() { return _selectedItemsPlacementsBuckets().withoutPlacements; }
+function selectedItemsWithPlacements()    { return _selectedItemsPlacementsBuckets().withPlacements; }
+function toggleItemSelection(id) {
+  if (state.selectedItemIds.has(id)) state.selectedItemIds.delete(id);
+  else state.selectedItemIds.add(id);
+  // Targeted refresh: just the row visual + the selection bar. Avoids a
+  // full table re-render which would discard search-input focus on rapid
+  // shift-click sequences. We find the row by its data-item-id rather
+  // than parsing the onclick attribute, so brittle string-matching isn't
+  // in the picture.
+  const row = document.querySelector(`#tableWrap_items tr[data-item-id="${id}"]`);
+  if (row) row.classList.toggle('row-selected', state.selectedItemIds.has(id));
+  refreshItemsSelectionBar();
+  refreshSelectAllHeaderState();
+}
+function toggleSelectAllVisibleItems() {
+  const { filtered } = computeFilteredList('items');
+  const visibleIds = filtered.map(r => r.id);
+  if (visibleIds.length === 0) return;
+  const allSelected = visibleIds.every(id => state.selectedItemIds.has(id));
+  if (allSelected) {
+    visibleIds.forEach(id => state.selectedItemIds.delete(id));
+  } else {
+    visibleIds.forEach(id => state.selectedItemIds.add(id));
+  }
+  // Full table refresh — every visible row's checkbox state changes at once.
+  refreshListTable('items');
+}
+function clearItemsSelection() {
+  state.selectedItemIds.clear();
+  refreshListTable('items');
+}
+function refreshSelectAllHeaderState() {
+  // Keep the header checkbox in sync with the actual visible-row state
+  // after a single-row toggle (which doesn't re-render the table).
+  const { filtered } = computeFilteredList('items');
+  const visibleIds = filtered.map(r => r.id);
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every(id => state.selectedItemIds.has(id));
+  const headerCb = document.querySelector('#tableWrap_items thead input.row-check');
+  if (headerCb) headerCb.checked = allVisibleSelected;
+}
+function refreshItemsSelectionBar() {
+  const el = document.getElementById('itemsSelectionBar');
+  if (el) el.innerHTML = renderItemsSelectionBar();
+}
+function renderItemsSelectionBar() {
+  const count = state.selectedItemIds.size;
+  if (count === 0) return '';
+  // Compute how many of the selected items are still live (defensive — if
+  // any have been deleted out-of-band the displayed count reflects what
+  // the batch action will actually operate on).
+  const live = selectedItemsCurrent().length;
+  const stale = count - live;
+  // v57 (Request 2): selected items with placements can't be deleted. The
+  // DELETE button is enabled only when EVERY selected item is placement-
+  // free. Tooltip surfaces the reason when disabled so the user isn't
+  // left guessing why the button doesn't respond.
+  const { withPlacements } = _selectedItemsPlacementsBuckets();
+  const canDelete = live > 0 && withPlacements.length === 0;
+  const deleteTitle = canDelete
+    ? `Delete the ${live} selected item${live === 1 ? '' : 's'} permanently`
+    : withPlacements.length > 0
+      ? `${withPlacements.length} of the selected item${withPlacements.length === 1 ? ' has' : 's have'} placements — remove their stock first`
+      : 'Select items to enable delete';
+  return `
+    <div class="selection-bar">
+      <div class="sel-bar-left">
+        <span class="sel-bar-badge">${live}</span>
+        <span class="sel-bar-label">selected${stale > 0 ? ` <span class="muted">(${stale} since deleted)</span>` : ''}</span>
+      </div>
+      <div class="sel-bar-actions">
+        <button class="btn sm" onclick="openBatchAction('add')" ${live === 0 ? 'disabled' : ''} title="Add stock at one (site, location) for every selected item">+ ADD STOCK</button>
+        <button class="btn sm" onclick="openBatchAction('remove')" ${live === 0 ? 'disabled' : ''} title="Remove stock from one (site, location) for every selected item">− REMOVE STOCK</button>
+        <button class="btn sm" onclick="openBatchAction('move')" ${live === 0 ? 'disabled' : ''} title="Move stock from one location to another for every selected item">↔ MOVE STOCK</button>
+        <!-- v57 (Request 2): DELETE sits right next to MOVE STOCK per the
+             user's request. Uses the existing .btn.danger red styling so it
+             reads as destructive. Disabled when any selected item carries
+             placements — the tooltip explains why. -->
+        <button class="btn sm danger" onclick="confirmBatchDeleteItems()" ${canDelete ? '' : 'disabled'} title="${escapeHtml(deleteTitle)}">✕ DELETE</button>
+        <button class="btn sm" onclick="openBatchPrintBarcodes()" ${live === 0 ? 'disabled' : ''} title="Print one 2×1 inch sticker per selected item">⌬ PRINT BARCODES</button>
+        <button class="btn ghost sm" onclick="clearItemsSelection()">CLEAR</button>
+      </div>
+    </div>`;
+}
+
+/* ---------- ITEMS COLUMNS POPOVER ----------
+   Small panel anchored to the COLUMNS button on the items list filter bar.
+   Lists every reorderable column (LIST_COLS.items) with:
+     · drag handle (☰) for reorder via HTML5 drag-and-drop
+     · checkbox for show/hide (disabled when this is the last visible col)
+     · the column's display name
+   Changes apply live + persist via saveItemsColumnPrefs. */
+
+function toggleColumnsPanel(e) {
+  if (e) e.stopPropagation();
+  // Domain-aware: if the panel is tracked open but for the categoryItems
+  // domain (the user was on Categories then switched here), open fresh
+  // rather than closing.
+  const isOpenForItems = state.columnsPanelOpen && state.columnsDomain === 'items';
+  state.columnsPanelOpen = !isOpenForItems;
+  state.columnsDomain = 'items';
+  if (state.columnsPanelOpen) {
+    // Install an outside-click handler that closes the panel. We add it on
+    // the next tick so the click that opened the panel doesn't immediately
+    // close it. Stored as a property on document so removeListener can
+    // find the same function reference on close.
+    setTimeout(() => {
+      document._columnsPanelOutsideHandler = (ev) => {
+        const panel = document.getElementById('columnsPanel');
+        const anchor = panel && panel.closest('.columns-anchor');
+        if (!anchor || !anchor.contains(ev.target)) closeColumnsPanel();
+      };
+      document.addEventListener('click', document._columnsPanelOutsideHandler);
+    }, 0);
+  } else {
+    closeColumnsPanel();
+    return;
+  }
+  refreshColumnsPanel();
+}
+function closeColumnsPanel() {
+  state.columnsPanelOpen = false;
+  if (document._columnsPanelOutsideHandler) {
+    document.removeEventListener('click', document._columnsPanelOutsideHandler);
+    delete document._columnsPanelOutsideHandler;
+  }
+  refreshColumnsPanel();
+}
+function refreshColumnsPanel() {
+  const panel = document.getElementById('columnsPanel');
+  if (!panel) return;
+  const open = state.columnsPanelOpen && state.columnsDomain === 'items';
+  panel.style.display = open ? '' : 'none';
+  panel.innerHTML = renderColumnsPanel();
+  // Sync the button's aria-expanded
+  const btn = panel.closest('.columns-anchor')?.querySelector('button[aria-haspopup="true"]');
+  if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function renderColumnsPanel() {
+  // v55 (Request 3): read from whichever prefs are active for the current
+  // view mode. Web and mobile are independent — the popover transparently
+  // controls one or the other based on state.viewMode.
+  const prefs = activeItemsColumnPrefs();
+  const byKey = new Map(LIST_COLS.items.map(c => [c.key, c]));
+  const hidden = new Set(prefs.hidden);
+  const visibleCount = LIST_COLS.items.length - hidden.size;
+  // Walk the order so the popover reflects current arrangement; drop any
+  // keys that no longer exist (defensive — reconcile should have done this
+  // already, but be tolerant if the state is mid-update).
+  const rows = prefs.order
+    .map(k => byKey.get(k))
+    .filter(Boolean)
+    .map(col => {
+      const isHidden = hidden.has(col.key);
+      const isLastVisible = !isHidden && visibleCount === 1;
+      // v60 (Request 2): Item # ("number" key) is pinned on mobile. The
+      // checkbox is disabled with an explanatory tooltip. The toggle
+      // handler also refuses the change as a defensive backstop.
+      const isPinned = state.viewMode === 'mobile' && col.key === 'number';
+      const checkboxDisabled = isLastVisible || isPinned;
+      const disabledTitle = isPinned
+        ? 'Item # is required on mobile'
+        : isLastVisible
+          ? 'At least one column must stay visible'
+          : '';
+      const display = col.label && col.label.trim() ? col.label : (col.prefLabel || col.key);
+      return `
+        <li class="cp-row${state.draggingColumnKey === col.key ? ' is-dragging' : ''}"
+            draggable="true"
+            data-col-key="${col.key}"
+            ondragstart="onColumnDragStart(event, '${col.key}')"
+            ondragend="onColumnDragEnd(event)"
+            ondragover="onColumnDragOver(event, '${col.key}')"
+            ondragleave="onColumnDragLeave(event)"
+            ondrop="onColumnDrop(event, '${col.key}')">
+          <span class="cp-handle" aria-hidden="true">☰</span>
+          <label class="cp-checkbox-label">
+            <input type="checkbox" ${isHidden ? '' : 'checked'} ${checkboxDisabled ? `disabled title="${escapeHtml(disabledTitle)}"` : ''} onchange="toggleItemsColumnVisibility('${col.key}')" />
+            <span class="cp-name${isHidden ? ' is-hidden' : ''}">${escapeHtml(display)}</span>
+          </label>
+        </li>`;
+    }).join('');
+
+  return `
+    <div class="cp-head">
+      <div class="cp-title">COLUMNS${state.viewMode === 'mobile' ? ' · MOBILE' : ''}</div>
+      <div class="cp-hint">Drag ☰ to reorder · click ☑ to show/hide${state.viewMode === 'mobile' ? ' · separate from web' : ''}</div>
+    </div>
+    <ul class="cp-list">${rows}</ul>
+    <div class="cp-foot">
+      <button class="btn ghost sm" onclick="resetItemsColumnPrefs()">RESET TO DEFAULTS</button>
+    </div>`;
+}
+
+/* Drag-and-drop: HTML5 native. We track which key is being dragged in
+   state.draggingColumnKey (so the rendered HTML reflects it for CSS),
+   and use the dragover Y-coordinate vs the row's midpoint to decide
+   whether to drop before or after the target row. */
+function onColumnDragStart(e, key) {
+  state.draggingColumnKey = key;
+  e.dataTransfer.effectAllowed = 'move';
+  // Some browsers require setData to enable the drop; the actual value
+  // doesn't matter — we read state.draggingColumnKey directly.
+  try { e.dataTransfer.setData('text/plain', key); } catch (err) {}
+}
+function onColumnDragEnd(e) {
+  state.draggingColumnKey = null;
+  // Clear any drop-position visual hints on any row
+  document.querySelectorAll('#columnsPanel .cp-row').forEach(r => {
+    r.classList.remove('drop-before', 'drop-after');
+  });
+}
+function onColumnDragOver(e, key) {
+  if (!state.draggingColumnKey || state.draggingColumnKey === key) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  // Compute before/after based on the cursor position within the target row.
+  const row = e.currentTarget;
+  const rect = row.getBoundingClientRect();
+  const isAfter = (e.clientY - rect.top) > rect.height / 2;
+  // Refresh visual hints on every row — clear all, set on the current one.
+  document.querySelectorAll('#columnsPanel .cp-row').forEach(r => {
+    r.classList.remove('drop-before', 'drop-after');
+  });
+  row.classList.add(isAfter ? 'drop-after' : 'drop-before');
+}
+function onColumnDragLeave(e) {
+  // Don't blanket-clear here — dragleave fires when crossing into a child
+  // element of the row, which would cause flicker. The dragover handler
+  // re-applies the correct class on the next mousemove. We do clear when
+  // the mouse leaves the entire list (handled implicitly on dragend / drop).
+}
+function onColumnDrop(e, targetKey) {
+  e.preventDefault();
+  const fromKey = state.draggingColumnKey;
+  if (!fromKey || fromKey === targetKey) { onColumnDragEnd(e); return; }
+  const row = e.currentTarget;
+  const rect = row.getBoundingClientRect();
+  const isAfter = (e.clientY - rect.top) > rect.height / 2;
+  onColumnDragEnd(e);
+  reorderItemsColumn(fromKey, targetKey, isAfter ? 'after' : 'before');
+}
+
+/* ---------- CATEGORY ITEMS COLUMNS POPOVER (v49) ----------
+   Parallel popover infrastructure for the Categories tab's COLUMNS
+   button. Shares state.draggingColumnKey and the .columns-panel CSS
+   with the items popover, but has its own outside-click handler,
+   panel id (#categoryItemsColumnsPanel), and a `categoryColumnsPanelOpen`-
+   style flag tracked via state.columnsPanelOpen + state.columnsDomain. */
+
+function toggleCategoryItemsColumnsPanel(e) {
+  if (e) e.stopPropagation();
+  // Always-open semantics: if the user is opening this panel while the
+  // items one happens to be tracked-open in state, switch domain rather
+  // than try to keep two open at once.
+  const isOpenForCategory = state.columnsPanelOpen && state.columnsDomain === 'categoryItems';
+  state.columnsPanelOpen = !isOpenForCategory;
+  state.columnsDomain = 'categoryItems';
+  if (state.columnsPanelOpen) {
+    setTimeout(() => {
+      document._categoryItemsColumnsPanelOutsideHandler = (ev) => {
+        const panel = document.getElementById('categoryItemsColumnsPanel');
+        const anchor = panel && panel.closest('.columns-anchor');
+        if (!anchor || !anchor.contains(ev.target)) closeCategoryItemsColumnsPanel();
+      };
+      document.addEventListener('click', document._categoryItemsColumnsPanelOutsideHandler);
+    }, 0);
+  } else {
+    closeCategoryItemsColumnsPanel();
+    return;
+  }
+  refreshCategoryItemsColumnsPanel();
+}
+function closeCategoryItemsColumnsPanel() {
+  state.columnsPanelOpen = false;
+  if (document._categoryItemsColumnsPanelOutsideHandler) {
+    document.removeEventListener('click', document._categoryItemsColumnsPanelOutsideHandler);
+    delete document._categoryItemsColumnsPanelOutsideHandler;
+  }
+  refreshCategoryItemsColumnsPanel();
+}
+function refreshCategoryItemsColumnsPanel() {
+  const panel = document.getElementById('categoryItemsColumnsPanel');
+  if (!panel) return;
+  const open = state.columnsPanelOpen && state.columnsDomain === 'categoryItems';
+  panel.style.display = open ? '' : 'none';
+  panel.innerHTML = renderCategoryItemsColumnsPanel();
+  const btn = panel.closest('.columns-anchor')?.querySelector('button[aria-haspopup="true"]');
+  if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+function renderCategoryItemsColumnsPanel() {
+  const byKey = new Map(LIST_COLS.categoryItems.map(c => [c.key, c]));
+  const hidden = new Set(state.categoryItemsColumnPrefs.hidden);
+  const visibleCount = LIST_COLS.categoryItems.length - hidden.size;
+  const rows = state.categoryItemsColumnPrefs.order
+    .map(k => byKey.get(k))
+    .filter(Boolean)
+    .map(col => {
+      const isHidden = hidden.has(col.key);
+      const isLastVisible = !isHidden && visibleCount === 1;
+      // v60 (Request 2): Item # ("itemNumber" key) pinned on mobile —
+      // same reasoning as the items popover: hiding it would strand
+      // mobile users without an edit affordance.
+      const isPinned = state.viewMode === 'mobile' && col.key === 'itemNumber';
+      const checkboxDisabled = isLastVisible || isPinned;
+      const disabledTitle = isPinned
+        ? 'Item # is required on mobile'
+        : isLastVisible
+          ? 'At least one column must stay visible'
+          : '';
+      const display = col.label && col.label.trim() ? col.label : (col.prefLabel || col.key);
+      return `
+        <li class="cp-row${state.draggingColumnKey === col.key ? ' is-dragging' : ''}"
+            draggable="true"
+            data-col-key="${col.key}"
+            ondragstart="onCategoryItemsColumnDragStart(event, '${col.key}')"
+            ondragend="onCategoryItemsColumnDragEnd(event)"
+            ondragover="onCategoryItemsColumnDragOver(event, '${col.key}')"
+            ondragleave="onCategoryItemsColumnDragLeave(event)"
+            ondrop="onCategoryItemsColumnDrop(event, '${col.key}')">
+          <span class="cp-handle" aria-hidden="true">☰</span>
+          <label class="cp-checkbox-label">
+            <input type="checkbox" ${isHidden ? '' : 'checked'} ${checkboxDisabled ? `disabled title="${escapeHtml(disabledTitle)}"` : ''} onchange="toggleCategoryItemsColumnVisibility('${col.key}')" />
+            <span class="cp-name${isHidden ? ' is-hidden' : ''}">${escapeHtml(display)}</span>
+          </label>
+        </li>`;
+    }).join('');
+  return `
+    <div class="cp-head">
+      <div class="cp-title">COLUMNS</div>
+      <div class="cp-hint">Drag ☰ to reorder · click ☑ to show/hide</div>
+    </div>
+    <ul class="cp-list">${rows}</ul>
+    <div class="cp-foot">
+      <button class="btn ghost sm" onclick="resetCategoryItemsColumnPrefs()">RESET TO DEFAULTS</button>
+    </div>`;
+}
+
+/* Drag handlers — mirror the items versions but target the category
+   popover's DOM id and dispatch to reorderCategoryItemsColumn. */
+function onCategoryItemsColumnDragStart(e, key) {
+  state.draggingColumnKey = key;
+  e.dataTransfer.effectAllowed = 'move';
+  try { e.dataTransfer.setData('text/plain', key); } catch (err) {}
+}
+function onCategoryItemsColumnDragEnd(e) {
+  state.draggingColumnKey = null;
+  document.querySelectorAll('#categoryItemsColumnsPanel .cp-row').forEach(r => {
+    r.classList.remove('drop-before', 'drop-after', 'is-dragging');
+  });
+}
+function onCategoryItemsColumnDragOver(e, key) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  document.querySelectorAll('#categoryItemsColumnsPanel .cp-row').forEach(r => {
+    r.classList.remove('drop-before', 'drop-after');
+  });
+  if (key === state.draggingColumnKey) return;
+  const row = e.currentTarget;
+  const rect = row.getBoundingClientRect();
+  const isAfter = (e.clientY - rect.top) > rect.height / 2;
+  row.classList.add(isAfter ? 'drop-after' : 'drop-before');
+}
+function onCategoryItemsColumnDragLeave(e) {
+  const row = e.currentTarget;
+  if (row && !row.contains(e.relatedTarget)) {
+    row.classList.remove('drop-before', 'drop-after');
+  }
+}
+function onCategoryItemsColumnDrop(e, targetKey) {
+  e.preventDefault();
+  const fromKey = state.draggingColumnKey;
+  if (!fromKey || fromKey === targetKey) { onCategoryItemsColumnDragEnd(e); return; }
+  const row = e.currentTarget;
+  const rect = row.getBoundingClientRect();
+  const isAfter = (e.clientY - rect.top) > rect.height / 2;
+  onCategoryItemsColumnDragEnd(e);
+  reorderCategoryItemsColumn(fromKey, targetKey, isAfter ? 'after' : 'before');
+}
+
+function clearFilters(type) {
+  state.search[type] = '';
+  if (type === 'items') {
+    state.filters.items = { category: '', site: '' };
+    // v50 (Item 2): "CLEAR" wipes any user override of the items site
+    // dropdown — the next renderListPage will re-sync it from the
+    // working-site. Without this, clicking CLEAR would set site='' but
+    // immediately a working-site of one would re-pin it via sync, which
+    // looks like CLEAR didn't fully work.
+    state._itemsSiteUserOverride = true;
+  }
+  render();
+}
+
+function renderEmptyState(type) {
+  const cfg = ENTITIES[type];
+  const messages = {
+    items:      { title: 'NO ITEMS YET',      text: 'Create item master records' },
+    placements: { title: 'NO PLACEMENTS YET', text: 'Assign items to sites and locations · multiple per item supported' },
+    sites:      { title: 'NO SITES YET',      text: 'Define physical locations' },
+    locations:  { title: 'NO LOCATIONS YET',  text: 'Add specific bins or aisles within your sites' },
+    categories: { title: 'NO CATEGORIES YET', text: 'Create categories to classify items' },
+    customers:  { title: 'NO CUSTOMERS YET',  text: 'Add customer accounts and contact info' },
+    users:      { title: 'NO USERS YET',      text: 'Add team members who use this system' }
+  };
+  const m = messages[type];
+  return `
+    <div class="empty">
+      <div class="empty-icon">∅</div>
+      <div class="empty-title">${m.title}</div>
+      <div class="empty-text">// ${m.text}</div>
+      <button class="btn" onclick="openForm('${type}')">+ Add First ${cfg.singular}</button>
+    </div>`;
+}
+
+/* ============ FORM MODAL ============ */
+function openForm(type, id = null) {
+  const existing = id ? state.data[type].find(r => r.id === id) : null;
+  state.formData = existing ? { ...existing } : {};
+  state.formErrors = {};
+  state.activeForm = { type, id };
+  renderForm();
+}
+
+function renderForm() {
+  const { type, id } = state.activeForm;
+  const cfg = ENTITIES[type];
+  const existing = id ? state.data[type].find(r => r.id === id) : null;
+  const isEdit = !!existing;
+
+  const fieldsHtml = cfg.fields.map(field => renderField(field, state.formData[field.key], state.formErrors[field.key])).join('');
+  const requiredCount = cfg.fields.filter(f => f.required).length;
+  const optionalCount = cfg.fields.filter(f => !f.required).length;
+
+  const isLg = type === 'items' || type === 'customers';
+
+  // Tagged-customers section appears only when EDITING an existing item.
+  // For a new item, the record has no id yet, so there's nothing to tag
+  // against — the user has to save first. A small hint replaces the
+  // section in that case.
+  const tagSectionHtml = (type === 'items')
+    ? (isEdit
+        ? renderItemTagsSection(existing)
+        : `<div class="form-section-divider"></div>
+           <div class="form-section-head">TAGGED CUSTOMERS</div>
+           <div class="form-section-hint">// Save this item first — then re-open to tag customers.</div>`)
+    : '';
+
+  document.getElementById('modalHost').innerHTML = `
+    <div class="modal-overlay"
+         onclick="if(event.target===this) closeForm()"
+         ondragover="event.preventDefault()"
+         ondrop="event.preventDefault()">
+      <div class="modal ${isLg ? 'lg' : ''}">
+        <div class="modal-head">
+          <div class="modal-title-row">
+            <div class="modal-title">${isEdit ? 'EDIT' : 'NEW'} ${cfg.singular.toUpperCase()}</div>
+            <div class="modal-sub">// ${requiredCount} REQUIRED · ${optionalCount} OPTIONAL FIELD${optionalCount === 1 ? '' : 'S'}</div>
+          </div>
+          <button class="close-btn" onclick="closeForm()">×</button>
+        </div>
+        <div class="modal-body">
+          <form id="recordForm" onsubmit="submitForm(event)">
+            <div class="form-grid">${fieldsHtml}</div>
+            <div class="legend">
+              <span><span class="legend-dot req"></span> REQUIRED</span>
+              <span><span class="legend-dot opt"></span> OPTIONAL</span>
+            </div>
+          </form>
+          ${tagSectionHtml}
+        </div>
+        <div class="modal-foot">
+          <div class="modal-foot-info">${isEdit && existing.createdAt ? '// CREATED ' + fmtDate(existing.createdAt) : '// NEW RECORD'}</div>
+          <div class="modal-foot-buttons">
+            <button class="btn ghost" onclick="closeForm()">CANCEL</button>
+            <button class="btn" onclick="document.getElementById('recordForm').requestSubmit()">${isEdit ? 'SAVE CHANGES' : 'CREATE ' + cfg.singular.toUpperCase()}</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  setTimeout(() => { const f = document.querySelector('#recordForm input, #recordForm select, #recordForm textarea'); if (f) f.focus(); }, 50);
+}
+
+/* ---------- TAG UI ----------
+   Two access points:
+     · Item edit form (renderItemTagsSection below) — manage tags for the
+       currently-edited item
+     · Customer view (renderCustomerView) — manage tags for one customer
+   Both reuse the same tag-form modal (renderTagFormModal). */
+
+function renderItemTagsSection(item) {
+  const tags = tagsForItem(item.id);
+  return `
+    <div class="form-section-divider"></div>
+    <div class="form-section-head">
+      <span>TAGGED CUSTOMERS</span>
+      <button type="button" class="btn ghost sm" onclick="openTagForm('item', '${item.id}', null)" ${state.data.customers.length === 0 ? 'disabled title="No customers defined — add one under Lookups → Customers first"' : ''}>+ ADD TAG</button>
+    </div>
+    ${state.data.customers.length === 0
+      ? `<div class="form-section-hint">// No customers yet · add one under Lookups → Customers to enable tagging.</div>`
+      : tags.length === 0
+        ? `<div class="form-section-hint">// No customers tagged to this item yet.</div>`
+        : `<div class="tag-rows">
+            ${tags.map(t => {
+              const c = state.data.customers.find(x => x.id === t.customerId);
+              const custName = c ? c.customerName : '(deleted customer)';
+              return `
+                <div class="tag-row">
+                  <div class="tag-row-name">${escapeHtml(custName)}</div>
+                  <div class="tag-row-qty">qty: <span class="mono">${Number(t.quantity).toLocaleString()}</span></div>
+                  <div class="tag-row-actions">
+                    <button type="button" class="btn ghost sm" onclick="openTagForm('item', '${item.id}', '${t.id}')">EDIT</button>
+                    <button type="button" class="btn ghost sm" onclick="confirmDeleteTag('${t.id}', 'item')">REMOVE</button>
+                  </div>
+                </div>`;
+            }).join('')}
+          </div>`}
+  `;
+}
+
+/* Open the small tag-form modal. Two contexts:
+     · anchor === 'item'     → user is editing an item · customer picker shown
+     · anchor === 'customer' → user is on the customer view · item picker shown
+   tagId is provided when editing an existing tag; null when adding. */
+function openTagForm(anchor, anchorId, tagId) {
+  const tag = tagId ? state.data.tags.find(t => t.id === tagId) : null;
+  state.tagFormCtx = {
+    mode: tag ? 'edit' : 'add',
+    anchor,
+    itemId:     anchor === 'item' ? anchorId : (tag ? tag.itemId : ''),
+    customerId: anchor === 'customer' ? anchorId : (tag ? tag.customerId : ''),
+    tagId: tag ? tag.id : null,
+    quantity: tag ? String(tag.quantity) : ''
+  };
+  renderTagFormModal();
+}
+function closeTagForm() {
+  state.tagFormCtx = null;
+  // We're inside another modal (either the item form OR the customer view),
+  // so closing the tag modal must re-render that context — not clear modalHost.
+  // For the item form, re-render the whole form so the tags section reflects
+  // any new/edited tag. For the customer view, the underlying page is rendered
+  // by render(); calling render() restores it.
+  const ctx = state._lastTagFormAnchor;
+  state._lastTagFormAnchor = null;
+  if (ctx === 'item' && state.activeForm && state.activeForm.type === 'items' && state.activeForm.id) {
+    renderForm();
+  } else {
+    document.getElementById('modalHost').innerHTML = '';
+    render();
+  }
+}
+function renderTagFormModal() {
+  const ctx = state.tagFormCtx;
+  if (!ctx) return;
+  state._lastTagFormAnchor = ctx.anchor; // remembered so closeTagForm can restore
+  const isEdit = ctx.mode === 'edit';
+
+  // Build picker options. When anchor==='item' we show a customer picker;
+  // exclude customers already tagged to this item (except the one being
+  // edited) so the user can't accidentally create a "duplicate" via the
+  // form — upsertTag would silently merge it, which is correct but might
+  // surprise the user. The same logic applies when anchor==='customer'
+  // for the item picker.
+  const occupiedKeys = new Set(
+    state.data.tags
+      .filter(t => ctx.anchor === 'item' ? t.itemId === ctx.itemId : t.customerId === ctx.customerId)
+      .filter(t => t.id !== ctx.tagId)
+      .map(t => ctx.anchor === 'item' ? t.customerId : t.itemId)
+  );
+
+  let pickerHtml = '';
+  if (ctx.anchor === 'item') {
+    // customer picker
+    const eligible = state.data.customers
+      .filter(c => !occupiedKeys.has(c.id))
+      .sort((a,b) => a.customerName.localeCompare(b.customerName));
+    pickerHtml = `
+      <div class="field full">
+        <div class="field-label-row"><label>Customer</label><span class="req-badge">REQUIRED</span></div>
+        <select name="customerId" ${isEdit ? 'disabled' : ''} onchange="state.tagFormCtx.customerId=this.value">
+          ${isEdit
+            ? `<option value="${ctx.customerId}" selected>${escapeHtml((state.data.customers.find(c => c.id === ctx.customerId) || {}).customerName || '(deleted)')}</option>`
+            : `<option value="">— select a customer —</option>
+               ${eligible.map(c => `<option value="${c.id}" ${ctx.customerId === c.id ? 'selected' : ''}>${escapeHtml(c.customerName)}</option>`).join('')}`}
+        </select>
+        ${isEdit ? `<div class="field-help">// Customer can't be changed when editing · remove and re-add to switch</div>` : ''}
+      </div>`;
+  } else {
+    // item picker
+    const eligible = state.data.items
+      .filter(i => !occupiedKeys.has(i.id))
+      .sort((a,b) => (a.itemNumber || '').localeCompare(b.itemNumber || ''));
+    pickerHtml = `
+      <div class="field full">
+        <div class="field-label-row"><label>Item</label><span class="req-badge">REQUIRED</span></div>
+        <select name="itemId" ${isEdit ? 'disabled' : ''} onchange="state.tagFormCtx.itemId=this.value">
+          ${isEdit
+            ? `<option value="${ctx.itemId}" selected>${escapeHtml(_itemPickerLabel(state.data.items.find(i => i.id === ctx.itemId)))}</option>`
+            : `<option value="">— select an item —</option>
+               ${eligible.map(i => `<option value="${i.id}" ${ctx.itemId === i.id ? 'selected' : ''}>${escapeHtml(_itemPickerLabel(i))}</option>`).join('')}`}
+        </select>
+        ${isEdit ? `<div class="field-help">// Item can't be changed when editing · remove and re-add to switch</div>` : ''}
+      </div>`;
+  }
+
+  document.getElementById('modalHost').innerHTML = `
+    <div class="modal-overlay" onclick="if(event.target===this) closeTagForm()" style="z-index:60;">
+      <div class="modal" style="width:480px;">
+        <div class="modal-head">
+          <div class="modal-title-row">
+            <div class="modal-title">${isEdit ? 'EDIT TAG' : 'ADD TAG'}</div>
+            <div class="modal-sub">// link item ⇄ customer with a quantity</div>
+          </div>
+          <button class="close-btn" onclick="closeTagForm()">×</button>
+        </div>
+        <div class="modal-body">
+          <form id="tagForm" onsubmit="submitTagForm(event)">
+            <div class="form-grid">
+              ${pickerHtml}
+              <div class="field full">
+                <div class="field-label-row"><label>Quantity</label><span class="req-badge">REQUIRED</span></div>
+                <input type="number" name="quantity" class="mono-input" min="1" step="1" value="${escapeHtml(ctx.quantity)}" placeholder="e.g. 5" oninput="state.tagFormCtx.quantity=this.value" />
+              </div>
+            </div>
+            <div class="field-error" id="tagFormError" style="margin-top:10px; min-height:18px;"></div>
+          </form>
+        </div>
+        <div class="modal-foot">
+          <div></div>
+          <div class="modal-foot-buttons">
+            <button class="btn ghost" onclick="closeTagForm()">CANCEL</button>
+            <button class="btn" onclick="document.getElementById('tagForm').requestSubmit()">${isEdit ? 'SAVE' : 'ADD TAG'}</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  setTimeout(() => { const f = document.querySelector('#tagForm select:not([disabled]), #tagForm input[name="quantity"]'); if (f) f.focus(); }, 50);
+}
+function _itemPickerLabel(i) {
+  if (!i) return '(deleted item)';
+  return i.name ? `${i.itemNumber} · ${i.name}` : i.itemNumber;
+}
+
+async function submitTagForm(e) {
+  e.preventDefault();
+  const ctx = state.tagFormCtx;
+  const errEl = document.getElementById('tagFormError');
+  const setError = msg => { if (errEl) errEl.textContent = msg; };
+  if (!ctx.itemId)     return setError('Select an item');
+  if (!ctx.customerId) return setError('Select a customer');
+  const qty = parseInt(ctx.quantity, 10);
+  if (!qty || qty <= 0 || isNaN(qty)) return setError('Quantity must be a whole number ≥ 1');
+
+  const result = await upsertTag(ctx.itemId, ctx.customerId, qty);
+  if (!result) return setError('Failed to save tag');
+  toast(ctx.mode === 'edit' ? 'Tag updated' : 'Tag added', 'success');
+  closeTagForm();
+}
+
+function confirmDeleteTag(tagId, returnTo) {
+  const tag = state.data.tags.find(t => t.id === tagId);
+  if (!tag) return;
+  const label = _tagLabel(tag);
+  showConfirmModal({
+    title: 'REMOVE TAG',
+    message: `<p>Remove the tag <strong style="font-family:'JetBrains Mono',monospace; color:var(--amber);">${escapeHtml(label)}</strong>?</p><p style="color:var(--text-dim);font-size:12px;margin-top:10px;font-family:'JetBrains Mono',monospace;">// Logged in action log · doesn't affect stock or placements.</p>`,
+    confirmLabel: 'REMOVE', confirmClass: 'danger',
+    onConfirm: async () => {
+      await deleteTag(tagId);
+      toast('Tag removed', 'success');
+      // Re-render whatever context called us
+      if (returnTo === 'item' && state.activeForm && state.activeForm.type === 'items' && state.activeForm.id) {
+        renderForm();
+      } else {
+        render();
+      }
+    }
+  });
+}
+
+function renderField(field, value, error) {
+  const reqBadge = field.required ? `<span class="req-badge">REQUIRED</span>` : `<span class="opt-badge">OPTIONAL</span>`;
+  const errClass = error ? 'has-error' : '';
+  const reqClass = field.required ? 'required-input' : '';
+  const monoClass = field.mono ? 'mono-input' : '';
+  const v = value == null ? '' : value;
+  let inputHtml = '';
+
+  if (field.type === 'textarea') {
+    inputHtml = `<textarea name="${field.key}" class="${errClass} ${reqClass}" rows="3" placeholder="${escapeHtml(field.placeholder||'')}" oninput="state.formData['${field.key}']=this.value; clearError('${field.key}');">${escapeHtml(v)}</textarea>`;
+  } else if (field.type === 'select-site') {
+    const sites = [...state.data.sites].sort((a,b) => a.name.localeCompare(b.name));
+    inputHtml = `<select name="${field.key}" class="${errClass} ${reqClass}" onchange="state.formData['${field.key}']=this.value; ${state.activeForm && state.activeForm.type === 'items' ? `state.formData.locationId=''; clearError('${field.key}'); renderForm();` : `clearError('${field.key}');`}">
+      <option value="">— select a site —</option>
+      ${sites.map(s => `<option value="${s.id}" ${v === s.id ? 'selected' : ''}>${escapeHtml(s.name)}</option>`).join('')}
+    </select>`;
+  } else if (field.type === 'select-location') {
+    const currentSite = state.formData.siteId;
+    const locations = state.data.locations.filter(l => !currentSite || l.siteId === currentSite).sort((a,b) => a.name.localeCompare(b.name));
+    const noLocs = locations.length === 0;
+    inputHtml = `<select name="${field.key}" class="${errClass} ${reqClass}" ${noLocs ? 'disabled' : ''} onchange="state.formData['${field.key}']=this.value; clearError('${field.key}');">
+      <option value="">${noLocs ? (currentSite ? '— no locations defined for this site —' : '— select a site first —') : '— optional —'}</option>
+      ${locations.map(l => `<option value="${l.id}" ${v === l.id ? 'selected' : ''}>${escapeHtml(l.name)}</option>`).join('')}
+    </select>`;
+  } else if (field.type === 'select-category') {
+    // Render top-level categories alphabetically, with their sub-categories
+    // listed immediately below each parent and visually indented. Items can
+    // attach to either a top-level or a sub.
+    const all = state.data.categories;
+    const tops = all.filter(c => !c.parentId).sort((a,b) => a.name.localeCompare(b.name));
+    const orphans = all.filter(c => c.parentId && !all.find(p => p.id === c.parentId));
+    const groups = tops.map(top => ({
+      top,
+      subs: all.filter(c => c.parentId === top.id).sort((a,b) => a.name.localeCompare(b.name))
+    }));
+    let opts = '';
+    groups.forEach(g => {
+      opts += `<option value="${g.top.id}" ${v === g.top.id ? 'selected' : ''}>${escapeHtml(g.top.name)}</option>`;
+      g.subs.forEach(s => {
+        opts += `<option value="${s.id}" ${v === s.id ? 'selected' : ''}>\u00a0\u00a0\u00a0\u00a0↳ ${escapeHtml(s.name)}</option>`;
+      });
+    });
+    // Orphaned subs (parent was deleted somehow) still need to be selectable
+    // so the user can re-home them; render at the end with a marker.
+    orphans.forEach(o => {
+      opts += `<option value="${o.id}" ${v === o.id ? 'selected' : ''}>${escapeHtml(o.name)} (orphaned)</option>`;
+    });
+    inputHtml = `<select name="${field.key}" class="${errClass} ${reqClass}" onchange="state.formData['${field.key}']=this.value; clearError('${field.key}');">
+      <option value="">— select a category —</option>
+      ${opts}
+    </select>`;
+  } else if (field.type === 'select-parent-category') {
+    // Used only on the categories form itself. The dropdown lists categories
+    // that are eligible to be a parent, namely:
+    //   - any top-level category (parentId == null)
+    //   - EXCLUDING the record being edited (no self-reference)
+    //   - EXCLUDING any category that already has a parent (no grandchildren)
+    //   - EXCLUDING any category that already has its own children (would
+    //     create a 3-level chain once this record is attached — but only if
+    //     this record IS being demoted; we let validation reject that case
+    //     with a clear error rather than silently hiding the option)
+    const currentId = state.activeForm ? state.activeForm.id : null; // null when adding new
+    const tops = state.data.categories
+      .filter(c => !c.parentId && c.id !== currentId)
+      .sort((a,b) => a.name.localeCompare(b.name));
+    inputHtml = `<select name="${field.key}" class="${errClass} ${reqClass}" onchange="state.formData['${field.key}']=this.value; clearError('${field.key}');">
+      <option value="">— none (top-level category) —</option>
+      ${tops.map(c => `<option value="${c.id}" ${v === c.id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('')}
+    </select>`;
+  } else if (field.type === 'select-item') {
+    const items = [...state.data.items].sort((a,b) => a.itemNumber.localeCompare(b.itemNumber));
+    inputHtml = `<select name="${field.key}" class="${errClass} ${reqClass}" onchange="state.formData['${field.key}']=this.value; clearError('${field.key}');">
+      <option value="">— select an item —</option>
+      ${items.map(i => `<option value="${i.id}" ${v === i.id ? 'selected' : ''}>${escapeHtml(i.itemNumber)}${i.name ? ' — ' + escapeHtml(i.name) : ''}</option>`).join('')}
+    </select>`;
+  } else if (field.type === 'currency') {
+    inputHtml = `<div class="currency-input"><input type="number" name="${field.key}" step="0.01" min="0" class="${errClass} ${reqClass} mono-input" value="${v === '' ? '' : v}" placeholder="0.00" oninput="state.formData['${field.key}']=this.value; clearError('${field.key}');" /></div>`;
+  } else if (field.type === 'number') {
+    inputHtml = `<input type="number" name="${field.key}" min="0" step="1" class="${errClass} ${reqClass} mono-input" value="${v === '' ? '' : v}" placeholder="0" oninput="state.formData['${field.key}']=this.value; clearError('${field.key}');" />`;
+  } else if (field.type === 'image') {
+    inputHtml = `
+      <div class="image-drop ${v ? 'has-image' : ''}"
+           onclick="document.getElementById('imageInput_${field.key}').click()"
+           ondragover="handleImageDragOver(event, this)"
+           ondragleave="handleImageDragLeave(event, this)"
+           ondrop="handleImageDrop(event, this, '${field.key}')">
+        ${v ? `<img src="${v}" class="image-preview" alt="preview">` :
+          `<div class="image-drop-icon">+ IMG</div><div class="image-drop-text">// CLICK TO SELECT · OR DRAG &amp; DROP · PNG OR JPEG · AUTO-RESIZED</div>`}
+      </div>
+      ${v ? `<button type="button" class="btn ghost sm" onclick="state.formData['${field.key}']=null; renderForm();" style="margin-top:8px;align-self:flex-start;">Remove Image</button>` : ''}
+      <input type="file" id="imageInput_${field.key}" accept="image/png,image/jpeg" onchange="handleImageSelect(event, '${field.key}')" />`;
+  } else if (field.type === 'password') {
+    // Render password + confirm as two inputs in one field cell. They never
+    // bind to state.formData[field.key] directly — instead submitForm reads
+    // them by name and routes them through hashPassword() before saving.
+    // The original hash on the record is never exposed in the DOM.
+    const isEdit = !!(state.activeForm && state.activeForm.id);
+    const ph1 = isEdit ? '— leave blank to keep current —' : `at least ${PASSWORD_MIN_LENGTH} characters`;
+    const ph2 = isEdit ? '— leave blank to keep current —' : 're-enter to confirm';
+    inputHtml = `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+        <div>
+          <div class="field-help" style="margin-bottom:4px;">// ${isEdit ? 'NEW PASSWORD' : 'PASSWORD'}</div>
+          <input type="password" name="${field.key}" autocomplete="new-password"
+            class="${errClass} ${reqClass}" placeholder="${ph1}"
+            oninput="clearError('${field.key}');" />
+        </div>
+        <div>
+          <div class="field-help" style="margin-bottom:4px;">// CONFIRM</div>
+          <input type="password" name="${field.key}_confirm" autocomplete="new-password"
+            class="${errClass} ${reqClass}" placeholder="${ph2}"
+            oninput="clearError('${field.key}');" />
+        </div>
+      </div>`;
+  } else {
+    const inputType = field.type || 'text';
+    const baseInput = `<input type="${inputType}" name="${field.key}" class="${errClass} ${reqClass} ${monoClass}" value="${escapeHtml(v)}" placeholder="${escapeHtml(field.placeholder||'')}" oninput="state.formData['${field.key}']=this.value; clearError('${field.key}');" />`;
+    if (field.generate) {
+      // v62 (Request 1): the GENERATE button sits to the right of the
+      // input. Wrap in a flex container so the button is fixed-width
+      // and the input fills the remaining space. Field.full-style
+      // forms work because the wrapper is block-level; both sides
+      // share the same row.
+      inputHtml = `<div style="display:flex;gap:8px;align-items:stretch;">
+        <div style="flex:1;min-width:0;">${baseInput}</div>
+        <button type="button" class="btn ghost sm" onclick="generateAndFill('${field.key}')" title="Auto-generate the next ${escapeHtml(field.label)} value" style="flex-shrink:0;white-space:nowrap;">⚡ GENERATE</button>
+      </div>`;
+    } else {
+      inputHtml = baseInput;
+    }
+  }
+
+  return `
+    <div class="field ${field.full ? 'full' : ''}">
+      <div class="field-label-row"><label>${field.label}</label>${reqBadge}</div>
+      ${inputHtml}
+      ${field.help ? `<div class="field-help">// ${field.help}</div>` : ''}
+      <div class="field-error" data-error-for="${field.key}">${escapeHtml(error || '')}</div>
+    </div>`;
+}
+
+/* v62 (Request 1): auto-generate the next item number. Scans existing
+   item numbers matching the "ITEM-NNNN" pattern, finds the max N, and
+   returns the next zero-padded value. Items that use other formats
+   (e.g. "IT-LAPTOP-001", "PEN-15") aren't part of the sequence — the
+   generator only uses the ITEM-N space so it can coexist with custom
+   numbering schemes. Default zero-pad is 5 digits (ITEM-00001 …
+   ITEM-99999); auto-widens if the user ever crosses that. */
+function generateNextItemNumber() {
+  const prefix = 'ITEM-';
+  const re = new RegExp('^' + prefix + '(\\d+)$');
+  let max = 0;
+  for (const it of state.data.items) {
+    const m = (it.itemNumber || '').match(re);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  const next = String(max + 1);
+  return prefix + next.padStart(Math.max(5, next.length), '0');
+}
+
+/* Field-key-aware dispatcher. The renderField wrapper calls this with
+   the field key; we look up the right generator for that key. Currently
+   only itemNumber has one but the indirection keeps the door open for
+   other generated fields (location codes, etc.). */
+function generateAndFill(fieldKey) {
+  let val = '';
+  if (fieldKey === 'itemNumber') val = generateNextItemNumber();
+  if (!val) return;
+  state.formData[fieldKey] = val;
+  const input = document.querySelector('#recordForm [name="' + fieldKey + '"]');
+  if (input) input.value = val;
+  clearError(fieldKey);
+}
+
+function clearError(key) {
+  if (state.formErrors[key]) {
+    delete state.formErrors[key];
+    const errEl = document.querySelector(`[data-error-for="${key}"]`);
+    if (errEl) errEl.textContent = '';
+    const inputEl = document.querySelector(`#recordForm [name="${key}"]`);
+    if (inputEl) inputEl.classList.remove('has-error');
+  }
+}
+
+function handleImageSelect(e, fieldKey) {
+  const file = e.target.files[0];
+  if (!file) return;
+  processImageFile(file, fieldKey);
+}
+
+/* Shared between the file-picker (handleImageSelect) and the drop zone
+   (handleImageDrop). Validates MIME, resizes, then writes the data-URL
+   onto state.formData and re-renders the form so the preview updates. */
+function processImageFile(file, fieldKey) {
+  if (!['image/png','image/jpeg'].includes(file.type)) {
+    toast('Only PNG or JPEG images allowed', 'error');
+    return;
+  }
+  resizeImage(file, 400, dataUrl => { state.formData[fieldKey] = dataUrl; renderForm(); });
+}
+
+/* Drag-and-drop on the .image-drop zone. dragover needs preventDefault for
+   the drop event to fire at all; we also set dropEffect = 'copy' so the
+   cursor reflects that we're consuming the file. The is-dragover class
+   is toggled on the zone so CSS can highlight it during a drag.
+     · dragleave uses relatedTarget to ignore "leave" events that fire as
+       the cursor crosses one of the zone's child elements (the icon div,
+       the text div, or the preview img) — without this check the
+       highlight would flicker every time the cursor passes over a child. */
+function handleImageDragOver(e, el) {
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  if (!el.classList.contains('is-dragover')) el.classList.add('is-dragover');
+}
+function handleImageDragLeave(e, el) {
+  // Only remove the highlight when leaving the zone entirely, not when
+  // moving onto a descendant element of the zone.
+  if (!el.contains(e.relatedTarget)) el.classList.remove('is-dragover');
+}
+function handleImageDrop(e, el, fieldKey) {
+  e.preventDefault();
+  el.classList.remove('is-dragover');
+  const dt = e.dataTransfer;
+  if (!dt || !dt.files || dt.files.length === 0) return;
+  // If the user drops a multi-file selection, take just the first — the
+  // file input is single-file too, so behaviour matches.
+  processImageFile(dt.files[0], fieldKey);
+}
+function resizeImage(file, maxDim, cb) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    const img = new Image();
+    img.onload = () => {
+      let { width, height } = img;
+      if (width > maxDim || height > maxDim) { const r = Math.min(maxDim/width, maxDim/height); width = Math.round(width*r); height = Math.round(height*r); }
+      const c = document.createElement('canvas'); c.width = width; c.height = height;
+      c.getContext('2d').drawImage(img, 0, 0, width, height);
+      cb(c.toDataURL('image/jpeg', 0.78));
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+function closeForm() {
+  document.getElementById('modalHost').innerHTML = '';
+  state.formData = {}; state.formErrors = {}; state.activeForm = null;
+}
+
+async function submitForm(e) {
+  e.preventDefault();
+  const { type, id } = state.activeForm;
+  const cfg = ENTITIES[type];
+
+  // Collect from DOM (image is already in formData; password is read separately below)
+  const form = document.getElementById('recordForm');
+  cfg.fields.forEach(field => {
+    if (field.type === 'image' || field.type === 'password') return; // handled separately
+    const el = form.querySelector(`[name="${field.key}"]`);
+    if (el) state.formData[field.key] = el.value;
+  });
+
+  // Pull password + confirm pairs out of the DOM. We never store the raw
+  // password on state.formData; we hash it directly into cleaned below.
+  const passwordInputs = {};
+  cfg.fields.forEach(field => {
+    if (field.type !== 'password') return;
+    const pw  = form.querySelector(`[name="${field.key}"]`);
+    const pwc = form.querySelector(`[name="${field.key}_confirm"]`);
+    passwordInputs[field.key] = { value: pw ? pw.value : '', confirm: pwc ? pwc.value : '' };
+  });
+
+  const errors = validateRecord(type, state.formData, id);
+
+  // Password validation — runs after the standard field pass so errors show
+  // alongside other field errors and the modal only re-renders once.
+  const isEdit = !!id;
+  cfg.fields.forEach(field => {
+    if (field.type !== 'password') return;
+    const { value, confirm } = passwordInputs[field.key] || {};
+    const blank = !value && !confirm;
+    if (isEdit && blank) return; // editing and leaving both blank is allowed — keep current
+    const issue = passwordStrengthIssue(value);
+    if (issue) { errors[field.key] = issue; return; }
+    if (value !== confirm) { errors[field.key] = 'Passwords do not match'; return; }
+  });
+
+  state.formErrors = errors;
+  if (Object.keys(errors).length > 0) {
+    renderForm();
+    // Re-paint the password fields with empty values so the user retypes,
+    // rather than leaving the typed-but-rejected password sitting in the DOM.
+    document.querySelectorAll('#recordForm input[type=password]').forEach(el => el.value = '');
+    toast('Please fix the errors before saving', 'error');
+    return;
+  }
+
+  // Build cleaned record
+  const cleaned = {};
+  for (const field of cfg.fields) {
+    if (field.type === 'password') {
+      const { value } = passwordInputs[field.key] || {};
+      if (!value) continue; // edit + blank = keep existing hash, don't overwrite
+      const salt = generateSalt();
+      const hash = await hashPassword(value, salt, PASSWORD_ITERATIONS);
+      cleaned.passwordHash = hash;
+      cleaned.passwordSalt = salt;
+      cleaned.passwordIterations = PASSWORD_ITERATIONS;
+      continue;
+    }
+    const v = state.formData[field.key];
+    if (v == null || v === '') {
+      cleaned[field.key] = field.type === 'image' ? null : (field.required ? v : null);
+    } else if (field.type === 'currency' || field.type === 'number') {
+      cleaned[field.key] = parseFloat(v);
+    } else if (typeof v === 'string') {
+      cleaned[field.key] = v.trim();
+    } else {
+      cleaned[field.key] = v;
+    }
+  }
+
+  let recordLabel;
+  if (type === 'placements') {
+    const it = state.data.items.find(x => x.id === cleaned.itemId);
+    const st = state.data.sites.find(x => x.id === cleaned.siteId);
+    recordLabel = `${it ? it.itemNumber : '—'} @ ${st ? st.name : '—'}`;
+  } else {
+    const labelKey = type === 'items' ? 'itemNumber' : (type === 'customers' ? 'customerName' : (type === 'users' ? 'email' : 'name'));
+    recordLabel = cleaned[labelKey];
+  }
+  const actionType = type.toUpperCase().replace(/S$/, '') + (id ? '_UPDATE' : '_CREATE');
+
+  if (id) {
+    const idx = state.data[type].findIndex(r => r.id === id);
+    if (idx >= 0) {
+      const prev = state.data[type][idx];
+      const rawChanges = [];
+      Object.keys(cleaned).forEach(k => { if (JSON.stringify(prev[k]) !== JSON.stringify(cleaned[k])) rawChanges.push(k); });
+      // Collapse the password storage trio (hash / salt / iterations) into
+      // a single human-readable 'password' entry so the audit log doesn't
+      // leak which storage fields back the password.
+      const pwKeys = ['passwordHash','passwordSalt','passwordIterations'];
+      const pwTouched = rawChanges.some(k => pwKeys.includes(k));
+      const changes = rawChanges.filter(k => !pwKeys.includes(k));
+      if (pwTouched) changes.push('password');
+      state.data[type][idx] = { ...prev, ...cleaned, lastModifiedAt: Date.now(), lastModifiedBy: state.user.email };
+      await saveType(type);
+      // v51: if the edited user is the currently signed-in operator,
+      // sync state.user from the freshly-saved record so the topbar chip
+      // (avatar + name + title) reflects the new values immediately.
+      // Without this, name/title/profile-picture changes wouldn't show up
+      // in the chip until the next sign-in or page refresh.
+      if (type === 'users' && state.user && state.data.users[idx].id === state.user.id) {
+        const u = state.data.users[idx];
+        state.user = { id: u.id, email: u.email, firstName: u.firstName, lastName: u.lastName, title: u.title, profileImage: u.profileImage || null };
+        refreshUserChip();
+      }
+      logAction(actionType, type, recordLabel, 'Updated: ' + (changes.join(', ') || 'no fields'));
+      toast(`${cfg.singular} updated`, 'success');
+    }
+  } else {
+    const newRecord = { id: uid(), ...cleaned, createdAt: Date.now(), createdBy: state.user.email, lastModifiedAt: Date.now(), lastModifiedBy: state.user.email };
+    state.data[type].push(newRecord);
+    await saveType(type);
+    const newDetails = type === 'items'
+      ? `Cost ${cleaned.cost != null ? fmt$(cleaned.cost) : '—'}`
+      : type === 'placements'
+        ? (() => { const s = state.data.sites.find(x => x.id === cleaned.siteId); return `${s ? s.name : '?'} · qty ${cleaned.quantity != null ? cleaned.quantity : '—'}`; })()
+        : 'New record';
+    logAction(actionType, type, recordLabel, newDetails);
+    toast(`${cfg.singular} created`, 'success');
+  }
+  closeForm();
+  render();
+}
+
+/* ---------- DELETE ---------- */
+
+/* v57 (Request 2): bulk-delete the currently-selected items via the
+   selection bar's DELETE button. Hard rules:
+     · every selected item must be placement-free
+       (button is also disabled in that case — this is belt + suspenders)
+     · cascading tag removal is permitted (tags can't outlive their item)
+     · placements cascade is impossible by definition (all sel'd items
+       have zero placements at this point), so no placements code path here
+     · single bulk audit-log entry per delete event so the trail stays
+       readable when nuking many items at once
+
+   The confirm modal lists up to 10 item numbers + "and N more" so the
+   user can sanity-check what they're about to delete. */
+async function confirmBatchDeleteItems() {
+  const items = selectedItemsCurrent();
+  if (items.length === 0) return;
+  const { withPlacements } = _selectedItemsPlacementsBuckets();
+  if (withPlacements.length > 0) {
+    // Hit when the button is somehow enabled but placements exist (race
+    // condition with a cloud-sync update, manual button enable, etc.).
+    // The selection bar guards against this normally, but defense is cheap.
+    showInfoModal({
+      title: 'CANNOT DELETE',
+      message: `<p><strong>${withPlacements.length}</strong> of the selected item${withPlacements.length === 1 ? ' has' : 's have'} placements and can't be deleted:</p>
+        <ul style="margin:12px 0 0 18px;padding:0;color:var(--text-dim);font-family:'JetBrains Mono',monospace;font-size:12px;">
+          ${withPlacements.slice(0, 10).map(i => `<li>${escapeHtml(i.itemNumber)}${i.name ? ' — ' + escapeHtml(i.name) : ''}</li>`).join('')}
+          ${withPlacements.length > 10 ? `<li>… and ${withPlacements.length - 10} more</li>` : ''}
+        </ul>
+        <p style="color:var(--text-dim);font-size:12px;margin-top:12px;">Remove their stock first, then try again.</p>`
+    });
+    return;
+  }
+
+  const tagsToRemove = state.data.tags.filter(t => state.selectedItemIds.has(t.itemId));
+  const cascadeNote = tagsToRemove.length > 0
+    ? `<p style="color:var(--orange);font-size:12px;margin-top:10px;font-family:'JetBrains Mono',monospace;">// ${tagsToRemove.length} tag${tagsToRemove.length === 1 ? '' : 's'} will also be removed.</p>`
+    : '';
+  const itemList = items.slice(0, 10).map(i => `<li>${escapeHtml(i.itemNumber)}${i.name ? ' — ' + escapeHtml(i.name) : ''}</li>`).join('');
+  const more = items.length > 10 ? `<li style="color:var(--text-dim);">… and ${items.length - 10} more</li>` : '';
+
+  showConfirmModal({
+    title: 'CONFIRM BULK DELETION',
+    message: `<p>Permanently delete <strong>${items.length}</strong> item${items.length === 1 ? '' : 's'}?</p>
+      <ul style="margin:12px 0;padding-left:18px;max-height:240px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text);">
+        ${itemList}${more}
+      </ul>
+      ${cascadeNote}
+      <p style="color:var(--text-dim);font-size:12px;margin-top:10px;font-family:'JetBrains Mono',monospace;">// Logged in audit · cannot be undone.</p>`,
+    confirmLabel: `DELETE ${items.length}`,
+    confirmClass: 'danger',
+    onConfirm: async () => {
+      const idsToDelete = new Set(items.map(i => i.id));
+      state.data.items = state.data.items.filter(i => !idsToDelete.has(i.id));
+      await saveType('items');
+      if (tagsToRemove.length > 0) {
+        const tagIds = new Set(tagsToRemove.map(t => t.id));
+        state.data.tags = state.data.tags.filter(t => !tagIds.has(t.id));
+        await saveType('tags');
+      }
+      // Audit summary — first 5 item numbers + "+N more" for readability.
+      const summary = items.map(i => i.itemNumber).slice(0, 5).join(', ') + (items.length > 5 ? `, +${items.length - 5} more` : '');
+      logAction('ITEM_DELETE', 'items', summary, `Bulk deleted ${items.length} item${items.length === 1 ? '' : 's'}${tagsToRemove.length ? ` + ${tagsToRemove.length} cascading tag${tagsToRemove.length === 1 ? '' : 's'}` : ''}`);
+      toast(`Deleted ${items.length} item${items.length === 1 ? '' : 's'}`, 'success');
+      state.selectedItemIds.clear();
+      render();
+    }
+  });
+}
+
+function confirmDelete(type, id) {
+  const cfg = ENTITIES[type];
+  const record = state.data[type].find(r => r.id === id);
+  if (!record) return;
+
+  // Referential integrity
+  if (type === 'sites') {
+    const locs = state.data.locations.filter(l => l.siteId === id);
+    const pls  = state.data.placements.filter(p => p.siteId === id);
+    if (locs.length || pls.length) {
+      const parts = [];
+      if (pls.length)  parts.push(`<strong>${pls.length}</strong> placement${pls.length===1?'':'s'}`);
+      if (locs.length) parts.push(`<strong>${locs.length}</strong> location${locs.length===1?'':'s'}`);
+      showInfoModal({ title: 'CANNOT DELETE SITE', message: `<p>The site <strong>${escapeHtml(record.name)}</strong> still has ${parts.join(' and ')} attached.</p><p style="color:var(--text-dim);font-size:12px;margin-top:10px;">// Reassign or delete those records first.</p>` });
+      return;
+    }
+  }
+  if (type === 'locations') {
+    const pls = state.data.placements.filter(p => p.locationId === id);
+    if (pls.length) {
+      showInfoModal({ title: 'CANNOT DELETE LOCATION', message: `<p>The location <strong>${escapeHtml(record.name)}</strong> is referenced by <strong>${pls.length}</strong> placement${pls.length===1?'':'s'}.</p>` });
+      return;
+    }
+  }
+  if (type === 'categories') {
+    const subs = state.data.categories.filter(c => c.parentId === id);
+    if (subs.length) {
+      showInfoModal({ title: 'CANNOT DELETE CATEGORY', message: `<p>The category <strong>${escapeHtml(record.name)}</strong> still has <strong>${subs.length}</strong> sub-categor${subs.length===1?'y':'ies'} attached.</p><p style="color:var(--text-dim);font-size:12px;margin-top:10px;font-family:'JetBrains Mono',monospace;">// Remove or reassign the sub-categories first.</p>` });
+      return;
+    }
+    const its = state.data.items.filter(i => i.categoryId === id);
+    if (its.length) {
+      showInfoModal({ title: 'CANNOT DELETE CATEGORY', message: `<p>The category <strong>${escapeHtml(record.name)}</strong> still has <strong>${its.length}</strong> item${its.length===1?'':'s'} attached.</p>` });
+      return;
+    }
+  }
+  if (type === 'users' && record.email === state.user.email) {
+    showInfoModal({ title: 'CANNOT DELETE YOURSELF', message: `<p>You can't delete the account you're currently signed in as. Sign in as another user first.</p>` });
+    return;
+  }
+
+  // Build a friendly label for the confirm dialog and audit log
+  let label;
+  if (type === 'placements') {
+    const it = state.data.items.find(x => x.id === record.itemId);
+    const st = state.data.sites.find(x => x.id === record.siteId);
+    label = `${it ? it.itemNumber : '—'} @ ${st ? st.name : '—'}`;
+  } else {
+    label = record.itemNumber || record.name || record.customerName || ((record.firstName||'') + ' ' + (record.lastName||'')).trim() || 'this record';
+  }
+
+  // For items, also warn about and cascade delete their placements
+  const cascadingPlacements = type === 'items' ? state.data.placements.filter(p => p.itemId === id) : [];
+  // For both items and customers, warn about cascading tags. Tags are pure
+  // associations — they can't survive without one of the two anchors.
+  const cascadingTags = (type === 'items' || type === 'customers')
+    ? state.data.tags.filter(t => (type === 'items' ? t.itemId === id : t.customerId === id))
+    : [];
+  const cascadeNotes = [];
+  if (cascadingPlacements.length) {
+    cascadeNotes.push(`<p style="color:var(--orange);font-size:12px;margin-top:10px;font-family:'JetBrains Mono',monospace;">// This item has <strong>${cascadingPlacements.length}</strong> placement${cascadingPlacements.length===1?'':'s'} that will also be deleted.</p>`);
+  }
+  if (cascadingTags.length) {
+    cascadeNotes.push(`<p style="color:var(--orange);font-size:12px;margin-top:10px;font-family:'JetBrains Mono',monospace;">// This ${type === 'items' ? 'item' : 'customer'} has <strong>${cascadingTags.length}</strong> tag${cascadingTags.length===1?'':'s'} that will also be removed.</p>`);
+  }
+  const cascadeNote = cascadeNotes.join('');
+
+  showConfirmModal({
+    title: 'CONFIRM DELETION',
+    message: `<p>Permanently delete <strong style="font-family:'JetBrains Mono',monospace; color:var(--amber);">${escapeHtml(label)}</strong>?</p>${cascadeNote}<p style="color:var(--text-dim);font-size:12px;margin-top:10px;font-family:'JetBrains Mono',monospace;">// Logged in audit · cannot be undone.</p>`,
+    confirmLabel: 'DELETE', confirmClass: 'danger',
+    onConfirm: async () => {
+      state.data[type] = state.data[type].filter(r => r.id !== id);
+      await saveType(type);
+      // Cascade: remove the deleted item's placements
+      if (type === 'items' && cascadingPlacements.length) {
+        state.data.placements = state.data.placements.filter(p => p.itemId !== id);
+        await saveType('placements');
+      }
+      // Cascade: remove tags pointing at this item OR customer
+      if (cascadingTags.length) {
+        const cascadingIds = new Set(cascadingTags.map(t => t.id));
+        state.data.tags = state.data.tags.filter(t => !cascadingIds.has(t.id));
+        await saveType('tags');
+      }
+      const extras = [];
+      if (cascadingPlacements.length) extras.push(`${cascadingPlacements.length} placement(s)`);
+      if (cascadingTags.length) extras.push(`${cascadingTags.length} tag(s)`);
+      const detail = extras.length ? `Deleted record + ${extras.join(' + ')}` : 'Deleted record';
+      logAction(type.toUpperCase().replace(/S$/, '') + '_DELETE', type, label, detail);
+      // If we just deleted the customer being viewed, exit the customer view
+      if (type === 'customers' && state.activeCustomerView === id) state.activeCustomerView = null;
+      toast(`${cfg.singular} deleted`, 'success');
+      render();
+    }
+  });
+}
+
+function showConfirmModal({ title, message, confirmLabel='OK', confirmClass='', onConfirm }) {
+  document.getElementById('modalHost').innerHTML = `
+    <div class="modal-overlay" onclick="if(event.target===this) closeForm()">
+      <div class="modal" style="width:480px;">
+        <div class="modal-head"><div class="modal-title-row"><div class="modal-title">${title}</div></div><button class="close-btn" onclick="closeForm()">×</button></div>
+        <div class="modal-body">${message}</div>
+        <div class="modal-foot"><div></div><div class="modal-foot-buttons"><button class="btn ghost" onclick="closeForm()">CANCEL</button><button class="btn ${confirmClass}" id="modalConfirmBtn">${confirmLabel}</button></div></div>
+      </div>
+    </div>`;
+  document.getElementById('modalConfirmBtn').onclick = async () => { closeForm(); if (onConfirm) await onConfirm(); };
+}
+function showInfoModal({ title, message }) {
+  document.getElementById('modalHost').innerHTML = `
+    <div class="modal-overlay" onclick="if(event.target===this) closeForm()">
+      <div class="modal" style="width:480px;">
+        <div class="modal-head"><div class="modal-title-row"><div class="modal-title">${title}</div></div><button class="close-btn" onclick="closeForm()">×</button></div>
+        <div class="modal-body">${message}</div>
+        <div class="modal-foot"><div></div><div class="modal-foot-buttons"><button class="btn" onclick="closeForm()">OK</button></div></div>
+      </div>
+    </div>`;
+}
+
+/* v61 (Request 3): "where is this item, and how many at each spot?" —
+   opens a modal listing every (site, location, qty) row for an item.
+   Rows are sorted by site, then by location. Missing site/location
+   references are highlighted in red so the user can see at a glance
+   when their placement data references something that was deleted.
+   A footer row shows the total qty across all placements. */
+function openItemPlacementsModal(itemId) {
+  const item = state.data.items.find(i => i.id === itemId);
+  if (!item) return;
+  const placements = state.data.placements.filter(p => p.itemId === itemId);
+  if (placements.length === 0) return; // shouldn't happen — badge only shows when n>0
+  const decorated = placements.map(p => {
+    const s = state.data.sites.find(x => x.id === p.siteId);
+    const l = state.data.locations.find(x => x.id === p.locationId);
+    return {
+      siteName:    s ? s.name : '— missing site —',
+      siteMissing: !s,
+      locationName:    l ? l.name : '— missing location —',
+      locationMissing: !l,
+      qty: Number(p.quantity) || 0
+    };
+  }).sort((a, b) =>
+    a.siteName.localeCompare(b.siteName) || a.locationName.localeCompare(b.locationName)
+  );
+  const total = decorated.reduce((s, d) => s + d.qty, 0);
+  const rows = decorated.map(d => `
+    <tr>
+      <td>${d.siteMissing
+        ? `<span class="badge red">${escapeHtml(d.siteName)}</span>`
+        : `<span class="badge cyan">${escapeHtml(d.siteName)}</span>`}</td>
+      <td>${d.locationMissing
+        ? `<span class="badge red">${escapeHtml(d.locationName)}</span>`
+        : `<strong>${escapeHtml(d.locationName)}</strong>`}</td>
+      <td class="mono" style="text-align:right;">${d.qty.toLocaleString()}</td>
+    </tr>`).join('');
+  document.getElementById('modalHost').innerHTML = `
+    <div class="modal-overlay" onclick="if(event.target===this) closeForm()">
+      <div class="modal" style="width:620px;max-width:calc(100vw - 20px);">
+        <div class="modal-head">
+          <div class="modal-title-row">
+            <div class="modal-title">PLACEMENTS · ${escapeHtml(item.itemNumber || '')}</div>
+            <div class="modal-sub">// ${escapeHtml(item.name || '(unnamed)')} · ${placements.length} placement${placements.length === 1 ? '' : 's'}</div>
+          </div>
+          <button class="close-btn" onclick="closeForm()">×</button>
+        </div>
+        <div class="modal-body" style="padding:0;">
+          <div class="table-wrap" style="max-height:60vh;overflow-y:auto;">
+            <table>
+              <thead><tr><th>Site</th><th>Location</th><th style="text-align:right;">Qty</th></tr></thead>
+              <tbody>${rows}</tbody>
+              <tfoot><tr style="border-top:2px solid var(--border-strong);">
+                <td colspan="2" style="text-align:right;"><strong>Total</strong></td>
+                <td class="mono" style="text-align:right;"><strong>${total.toLocaleString()}</strong></td>
+              </tr></tfoot>
+            </table>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <div></div>
+          <div class="modal-foot-buttons">
+            <button class="btn ghost" onclick="closeForm(); openForm('items','${item.id}')" title="Open this item's edit form">EDIT ITEM</button>
+            <button class="btn" onclick="closeForm()">CLOSE</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+/* v61 (Request 4): "what's placed at this location?" — opens a modal
+   listing every (item, qty) row at the given location. Items missing
+   from state.data.items (orphan placements) are flagged in red. Each
+   item number is itself a click target that jumps to the item's edit
+   form, mirroring the v57 item-number-is-edit-target pattern. */
+function openLocationPlacementsModal(locationId) {
+  const location = state.data.locations.find(l => l.id === locationId);
+  if (!location) return;
+  const site = state.data.sites.find(s => s.id === location.siteId);
+  const placements = state.data.placements.filter(p => p.locationId === locationId);
+  if (placements.length === 0) return;
+  const decorated = placements.map(p => {
+    const it = state.data.items.find(x => x.id === p.itemId);
+    return {
+      itemId: p.itemId,
+      itemNumber: it ? (it.itemNumber || '') : '— missing item —',
+      itemName:   it ? (it.name || '') : '',
+      itemMissing: !it,
+      qty: Number(p.quantity) || 0
+    };
+  }).sort((a, b) => a.itemNumber.localeCompare(b.itemNumber));
+  const total = decorated.reduce((s, d) => s + d.qty, 0);
+  const rows = decorated.map(d => `
+    <tr>
+      <td>${d.itemMissing
+        ? `<span class="badge red">${escapeHtml(d.itemNumber)}</span>`
+        : `<span class="id-tag clickable" role="button" tabindex="0"`
+          + ` onclick="closeForm(); openForm('items','${d.itemId}')"`
+          + ` onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();closeForm();openForm('items','${d.itemId}');}"`
+          + ` title="${escapeHtml(d.itemNumber)} · click to edit">${escapeHtml(d.itemNumber)}</span>`}</td>
+      <td>${d.itemName ? escapeHtml(d.itemName) : '<span class="muted">—</span>'}</td>
+      <td class="mono" style="text-align:right;">${d.qty.toLocaleString()}</td>
+    </tr>`).join('');
+  document.getElementById('modalHost').innerHTML = `
+    <div class="modal-overlay" onclick="if(event.target===this) closeForm()">
+      <div class="modal" style="width:620px;max-width:calc(100vw - 20px);">
+        <div class="modal-head">
+          <div class="modal-title-row">
+            <div class="modal-title">PLACEMENTS AT ${escapeHtml((location.name || '').toUpperCase())}</div>
+            <div class="modal-sub">// ${site ? escapeHtml(site.name) + ' · ' : ''}${placements.length} placement${placements.length === 1 ? '' : 's'}</div>
+          </div>
+          <button class="close-btn" onclick="closeForm()">×</button>
+        </div>
+        <div class="modal-body" style="padding:0;">
+          <div class="table-wrap" style="max-height:60vh;overflow-y:auto;">
+            <table>
+              <thead><tr><th>Item #</th><th>Name</th><th style="text-align:right;">Qty</th></tr></thead>
+              <tbody>${rows}</tbody>
+              <tfoot><tr style="border-top:2px solid var(--border-strong);">
+                <td colspan="2" style="text-align:right;"><strong>Total</strong></td>
+                <td class="mono" style="text-align:right;"><strong>${total.toLocaleString()}</strong></td>
+              </tr></tfoot>
+            </table>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <div></div>
+          <div class="modal-foot-buttons">
+            <button class="btn" onclick="closeForm()">CLOSE</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+/* ---------- ADMIN PASSWORD RESET ----------
+   A signed-in user can reset another user's password via the Users list.
+   This is the practical answer to "I forgot my password" in a no-server,
+   no-email-recovery system: a teammate sets a new one and tells the user
+   through a secure channel. The action also clears any active lockout
+   against that user, so they can immediately use the new password. */
+function openPasswordReset(userId) {
+  const u = state.data.users.find(x => x.id === userId);
+  if (!u) return;
+  const isSelf = state.user && state.user.id === u.id;
+  document.getElementById('modalHost').innerHTML = `
+    <div class="modal-overlay" onclick="if(event.target===this) closeForm()">
+      <div class="modal" style="width:520px;">
+        <div class="modal-head">
+          <div class="modal-title-row">
+            <div class="modal-title">RESET PASSWORD</div>
+            <div class="modal-sub">// ${escapeHtml(u.firstName + ' ' + u.lastName)} · ${escapeHtml(u.email)}</div>
+          </div>
+          <button class="close-btn" onclick="closeForm()">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="notice" style="border-color:var(--orange);background:var(--notice-warn-bg);">
+            // <strong>OVERWRITES THE CURRENT PASSWORD</strong> — ${isSelf ? 'You\'re resetting your own password. After saving, the next sign-in will require the new value.' : 'After saving, this user will need the new password to sign in. Communicate it through a secure channel — passwords are never recoverable from the stored hash.'}
+          </div>
+          <form id="resetPwForm" onsubmit="submitPasswordReset(event, '${u.id}')">
+            <div class="form-grid">
+              <div class="field full">
+                <div class="field-label-row"><label>New Password</label><span class="req-badge">REQUIRED</span></div>
+                <input type="password" name="password" autocomplete="new-password" class="required-input" required placeholder="at least ${PASSWORD_MIN_LENGTH} characters">
+              </div>
+              <div class="field full">
+                <div class="field-label-row"><label>Confirm New Password</label><span class="req-badge">REQUIRED</span></div>
+                <input type="password" name="passwordConfirm" autocomplete="new-password" class="required-input" required placeholder="re-enter to confirm">
+              </div>
+            </div>
+            <div class="field-error" id="resetPwError" style="margin-top:10px;min-height:18px;"></div>
+          </form>
+        </div>
+        <div class="modal-foot">
+          <div class="modal-foot-info">// HASHED WITH PBKDF2-SHA256 · ${PASSWORD_ITERATIONS.toLocaleString()} ITERATIONS</div>
+          <div class="modal-foot-buttons">
+            <button class="btn ghost" onclick="closeForm()">CANCEL</button>
+            <button class="btn" onclick="document.getElementById('resetPwForm').requestSubmit()">Reset password</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  setTimeout(() => { const f = document.querySelector('#resetPwForm input[name=password]'); if (f) f.focus(); }, 50);
+}
+
+async function submitPasswordReset(e, userId) {
+  e.preventDefault();
+  const u = state.data.users.find(x => x.id === userId);
+  const errEl = document.getElementById('resetPwError');
+  errEl.textContent = '';
+  if (!u) { errEl.textContent = 'User no longer exists'; return; }
+
+  const password = e.target.password.value;
+  const confirm  = e.target.passwordConfirm.value;
+  const issue = passwordStrengthIssue(password);
+  if (issue) { errEl.textContent = issue; return; }
+  if (password !== confirm) { errEl.textContent = 'Passwords do not match'; return; }
+
+  const salt = generateSalt();
+  const hash = await hashPassword(password, salt, PASSWORD_ITERATIONS);
+  const idx = state.data.users.findIndex(x => x.id === userId);
+  state.data.users[idx] = {
+    ...u,
+    passwordHash: hash,
+    passwordSalt: salt,
+    passwordIterations: PASSWORD_ITERATIONS,
+    lastModifiedAt: Date.now(),
+    lastModifiedBy: state.user ? state.user.email : 'system'
+  };
+  await saveType('users');
+
+  // Clear any existing lockout for that user — the reset is a known-good
+  // recovery action and they should be able to sign in immediately.
+  await clearFailedAttempts(userId);
+
+  const isSelf = state.user && state.user.id === userId;
+  logAction('PASSWORD_RESET', 'users', u.email, isSelf ? 'Self password reset' : `Admin reset password for ${u.email}`);
+  closeForm();
+  toast(isSelf ? 'Your password was reset' : `Password reset for ${u.firstName} ${u.lastName}`, 'success');
+  render();
+}
+
+/* ============ CSV IMPORT (multi-target) ============
+   All import/export operations flow through the Settings → Import Data hub.
+   The hub renders entity cards; clicking one calls enterImport(target), which
+   loads renderImportView. The hub's Back button (and post-commit reset) call
+   returnToImportHub(). There are no per-tab import buttons anywhere else. */
+
+function enterImport(target) {
+  state.activeTab = 'settings';
+  state.settingsView = 'import';
+  state.activeCSVTab = target;
+  state.csvPreview = null;
+  closeSettingsMenu();
+  // Clear active class from all sidebar tabs — Settings isn't a sidebar entry.
+  document.querySelectorAll('#primaryTabs [data-tab]').forEach(b => b.classList.remove('active'));
+  render();
+}
+function returnToImportHub() {
+  state.settingsView = 'hub';
+  state.csvPreview = null;
+  render();
+}
+function goImportHub() {
+  state.activeTab = 'settings';
+  state.settingsView = 'hub';
+  state.csvPreview = null;
+  state._cloudForm = null;  // clear any in-flight cloud sync form state
+  closeSettingsMenu();
+  document.querySelectorAll('#primaryTabs [data-tab]').forEach(b => b.classList.remove('active'));
+  render();
+}
+/* Open the Theme picker. Mirrors goImportHub — same gear-menu pattern,
+   same settings tab. The primary tabs lose their "active" highlight
+   because Settings isn't a primary tab. */
+function goTheme() {
+  state.activeTab = 'settings';
+  state.settingsView = 'theme';
+  closeSettingsMenu();
+  document.querySelectorAll('#primaryTabs [data-tab]').forEach(b => b.classList.remove('active'));
+  render();
+}
+
+/* Open the View Mode picker (web/mobile layout). Same gear-menu pattern
+   as goTheme — the toggle itself lives on a Settings sub-page now,
+   replacing the topbar pill that used to sit between the cloud-sync
+   status and the gear button. */
+function goViewMode() {
+  state.activeTab = 'settings';
+  state.settingsView = 'viewMode';
+  closeSettingsMenu();
+  document.querySelectorAll('#primaryTabs [data-tab]').forEach(b => b.classList.remove('active'));
+  render();
+}
+
+function goCloudSync() {
+  state.activeTab = 'settings';
+  state.settingsView = 'cloudSync';
+  closeSettingsMenu();
+  document.querySelectorAll('#primaryTabs [data-tab]').forEach(b => b.classList.remove('active'));
+  render();
+}
+
+/* The Import Data hub. Lists every available CSV import as a card; each card
+   shows the entity name, current record count, and a brief description of what
+   the import accepts. The export section below lists every downloadable CSV.
+   This is the only place in the app where CSV operations live. */
+function renderImportHub(root) {
+  const importCards = [
+    { key: 'sites',      label: 'Sites',      blurb: 'Physical sites · only "name" is required',                           count: state.data.sites.length },
+    { key: 'locations',  label: 'Locations',  blurb: 'Locations within sites · both "site" and "name" are required',       count: state.data.locations.length },
+    { key: 'categories', label: 'Categories', blurb: 'Item category labels · only "name" is required',                      count: state.data.categories.length },
+    { key: 'customers',  label: 'Customers',  blurb: 'Customer accounts · only "customerName" is required',                 count: state.data.customers.length },
+    { key: 'items',      label: 'Items',      blurb: 'Item master records · only "itemNumber" is required',                 count: state.data.items.length },
+    { key: 'placements', label: 'Placements', blurb: 'Item × site × location stock rows · all four columns required · duplicates never flagged', count: state.data.placements.length }
+  ];
+
+  const exportItems = [
+    { label: 'Items',          desc: 'All item master records with category names, costs, total quantity, total cost, placement count, and audit metadata.', onclick: 'exportItemsCSV()',     enabled: state.data.items.length > 0,        countLabel: `${state.data.items.length} items` },
+    { label: 'Placements',     desc: 'Every (item, site, location, quantity) row with line cost and audit metadata. Resolved names, not internal IDs — portable across instances.', onclick: 'exportPlacementsCSV()', enabled: state.data.placements.length > 0,    countLabel: `${state.data.placements.length} placements` },
+    { label: 'Inventory Report',desc: 'By-category and by-site breakdown of inventory cost, plus the cross-tab grid. Mirrors the Reports page.',              onclick: 'exportReportCSV()',    enabled: state.data.placements.length > 0,    countLabel: `${state.data.placements.length} placements` },
+    { label: 'Action History', desc: 'Every Add, Remove, Adjust, and Move recorded in chronological order with operator, before/after quantities, and notes.',  onclick: 'exportActionLogCSV()', enabled: state.actionLog.length > 0,           countLabel: `${state.actionLog.length} entries` }
+  ];
+
+  root.innerHTML = `
+    <div class="page-head">
+      <div>
+        <div class="page-title">DATA IMPORT &amp; EXPORT</div>
+        <div class="page-sub">// Central hub for all CSV operations · the only place imports and exports live</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:24px;">
+      <div class="card-head"><div class="card-title">↑ Import from CSV</div></div>
+      <div class="card-body">
+        <div class="page-sub" style="margin-bottom:18px;">// Click any entity below to download its template, paste/upload your CSV, preview the parsed rows, and commit.</div>
+        <div class="target-grid">
+          ${importCards.map(c => `
+            <button class="target-card" type="button" onclick="enterImport('${c.key}')">
+              <div class="target-card-head">
+                <div class="target-card-label">${c.label}</div>
+                <div class="target-card-count">${c.count.toLocaleString()}</div>
+              </div>
+              <div class="target-card-blurb">${escapeHtml(c.blurb)}</div>
+              <div class="target-card-cta">↑ Open import →</div>
+            </button>
+          `).join('')}
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><div class="card-title">↓ Export to CSV</div></div>
+      <div class="card-body">
+        <div class="page-sub" style="margin-bottom:18px;">// One-click downloads of the data behind each major view.</div>
+        <div class="export-grid">
+          ${exportItems.map(x => `
+            <div class="export-card ${x.enabled ? '' : 'disabled'}">
+              <div class="export-card-head">
+                <div class="export-card-label">${x.label}</div>
+                <div class="export-card-count">${escapeHtml(x.countLabel)}</div>
+              </div>
+              <div class="export-card-blurb">${escapeHtml(x.desc)}</div>
+              <button class="btn ghost sm" ${x.enabled ? `onclick="${x.onclick}"` : 'disabled'}>↓ Download CSV</button>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* Theme picker. Each of the four themes renders as a clickable card with
+   a colored preview that uses inline styles (because the targeted theme
+   isn't applied to the document until the user commits). The currently-
+   active theme is marked with an active outline and a small "ACTIVE" tag.
+   No save button — clicking a card calls setTheme() which applies
+   immediately and persists. */
+function renderThemeView(root) {
+  const cards = THEMES.map(t => {
+    const p = t.preview;
+    const isActive = state.theme === t.name;
+    return `
+      <button type="button" class="theme-card ${isActive ? 'active' : ''}" onclick="setTheme('${t.name}')" aria-pressed="${isActive}">
+        <div class="theme-card-preview" style="background:${p.bg};">
+          <div class="theme-card-preview-surface" style="background:${p.surface};border:1px solid ${p.surface};"></div>
+          <div class="theme-card-preview-text" style="color:${p.text};">Aa</div>
+          <div class="theme-card-preview-bar" style="background:${p.amber};"></div>
+          <div class="theme-card-preview-thumb" style="background:${p.amber};"></div>
+        </div>
+        <div class="theme-card-body">
+          <div class="theme-card-name">${escapeHtml(t.label)}</div>
+          <div class="theme-card-desc">// ${escapeHtml(t.desc)}</div>
+          ${isActive ? `<div class="theme-card-active-tag">▸ ACTIVE</div>` : ''}
+        </div>
+      </button>`;
+  }).join('');
+
+  root.innerHTML = `
+    <div class="main">
+      <div class="page-head">
+        <div>
+          <div class="page-title">THEME</div>
+          <div class="page-sub">// Visual appearance · applies immediately · persists across reloads</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="card-title">Available Themes</div></div>
+        <div class="card-body">
+          <div class="theme-grid">${cards}</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* ============ VIEW MODE VIEW ============
+   Settings → View Mode. v66: expanded from a 2-state web/mobile toggle
+   into a 3-option picker that adds the "Simple" view mode — a kiosk-
+   style UI with only the Actions tab and a card-based Item Search tab.
+   The old #viewModeToggle topbar pill still exists for backward compat
+   (binary web ↔ mobile), but the canonical chooser is here. */
+function renderViewModeView(root) {
+  const mode = state.viewMode;
+  const card = (key, label, blurb) => `
+    <button class="vm-option ${mode === key ? 'is-active' : ''}" type="button"
+            onclick="setViewMode('${key}')"
+            aria-pressed="${mode === key ? 'true' : 'false'}"
+            title="Switch to ${label}">
+      <div class="vm-option-head">
+        <span class="vm-option-radio" aria-hidden="true">${mode === key ? '●' : '○'}</span>
+        <span class="vm-option-name">${label}</span>
+        ${mode === key ? '<span class="vm-option-current">CURRENT</span>' : ''}
+      </div>
+      <div class="vm-option-blurb">${blurb}</div>
+    </button>`;
+  root.innerHTML = `
+    <div class="main">
+      <div class="page-head">
+        <div>
+          <div class="page-title">VIEW MODE</div>
+          <div class="page-sub">// Pick the layout that fits this device · applies immediately · saved per-device</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="card-title">Layout</div></div>
+        <div class="card-body">
+          <div class="vm-options-grid">
+            ${card('web',    'Web',    '// Full desktop layout · sidebar nav · every tab visible · dense tables · best on laptops + tablets')}
+            ${card('mobile', 'Mobile', '// Touch-tightened version of the web layout · same features, compact spacing · best on phones')}
+            ${card('simple', 'Simple', '// Minimal kiosk UI · only the ACTIONS tab and a card-based ITEM SEARCH tab · best for warehouse / shop-floor use')}
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/* ============ LOGO VIEW ============
+   Settings → Logo. PNG upload form for the top-left brand mark. Only the
+   Jake Hardin profile can change it; other users either don't see the
+   gear-menu entry or — if they reached this view through some other path
+   — get an access-denied panel. The current logo (default or custom) is
+   previewed at the top so the user can see what's live before uploading
+   a replacement. */
+function renderLogoView(root) {
+  if (!isLogoAdmin()) {
+    root.innerHTML = `
+      <div class="main">
+        <div class="page-head">
+          <div>
+            <div class="page-title">LOGO</div>
+            <div class="page-sub">// Access denied · this profile can't change the logo</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-body">
+            <div class="page-sub">// Only the Jake Hardin profile can change the brand-mark logo. Ask Jake if you need an update.</div>
+          </div>
+        </div>
+      </div>`;
+    return;
+  }
+
+  const hasCustom = !!state.logo;
+  // Preview block: shows either the live PNG or the default "P&S" mark
+  // styled exactly the way the topbar renders it, so the user sees what
+  // they're about to replace.
+  const previewMark = hasCustom
+    ? `<div class="brand-mark custom-logo" style="width:96px;height:96px;"><img src="${escapeHtml(state.logo)}" alt="Current logo"></div>`
+    : `<div class="brand-mark" style="width:96px;height:96px;font-size:42px;">P&amp;S</div>`;
+  const sizeNote = hasCustom
+    ? `// Custom PNG · stored as base64 (~${Math.round((state.logo.length * 3 / 4) / 1024)} KB) · synced via cloud`
+    : `// Default chevron · no custom PNG uploaded yet`;
+
+  root.innerHTML = `
+    <div class="main">
+      <div class="page-head">
+        <div>
+          <div class="page-title">LOGO</div>
+          <div class="page-sub">// Brand mark in the top-left · PNG only · syncs to every signed-in device</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:24px;">
+        <div class="card-head"><div class="card-title">Current Logo</div></div>
+        <div class="card-body">
+          <div style="display:flex;align-items:center;gap:24px;flex-wrap:wrap;">
+            ${previewMark}
+            <div>
+              <div class="page-sub" style="margin:0 0 4px 0;">${sizeNote}</div>
+              <div class="page-sub" style="margin:0;">// The brand-name text "PAY &amp; SAVE" beside it is not affected.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:24px;">
+        <div class="card-head"><div class="card-title">Upload New PNG</div></div>
+        <div class="card-body">
+          <div class="page-sub" style="margin-bottom:14px;">
+            // Choose a square PNG with a transparent background for best results.
+            Recommended: 256×256 or 512×512. Hard limit: ${Math.round(LOGO_MAX_BYTES / 1024)} KB.
+            Smaller files sync faster across devices.
+          </div>
+          <input type="file" id="logoFileInput" accept="image/png" onchange="handleLogoFileChange(this)"
+                 style="display:block;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text);">
+          <div id="logoUploadStatus" style="font-family:'JetBrains Mono',monospace;font-size:12px;margin-top:12px;min-height:18px;color:var(--text-dim);"></div>
+        </div>
+      </div>
+
+      ${hasCustom ? `
+      <div class="card">
+        <div class="card-head"><div class="card-title">Reset</div></div>
+        <div class="card-body">
+          <div class="page-sub" style="margin-bottom:14px;">// Remove the custom PNG and restore the default P&amp;S chevron. Other devices update on next sync.</div>
+          <button class="btn ghost" onclick="if(confirm('Reset the logo to the default P&amp;S chevron? This affects every device.')) clearLogo();">↺ Reset to default</button>
+        </div>
+      </div>` : ''}
+    </div>
+  `;
+}
+
+/* ============ CLOUD SYNC VIEW ============
+   Settings → Cloud Sync. Setup wizard + live status + push/pull tools.
+   Three states it renders:
+     1. UNCONFIGURED: shows the setup wizard (signup link, SQL script, URL+key form)
+     2. CONFIGURED but DISABLED: shows the form pre-filled + an enable button
+     3. CONFIGURED AND ENABLED: shows status + push/pull/disable controls
+   ====================================================================*/
+function renderCloudSyncView(root) {
+  const configured = !!(CLOUD.url && CLOUD.anonKey);
+  const enabled = !!CLOUD.enabled;
+  const connected = !!CLOUD.connected;
+
+  // The SQL script the user runs ONCE in their Supabase project's SQL
+  // editor. Surfaced as a copy-pasteable code block.
+  const sqlSetup = `-- Run this in your Supabase project's SQL Editor.
+-- Creates the single key-value table the app uses, plus permissive
+-- row-level-security policies for anon access (so the anon key in
+-- the HTML can read/write), and enables real-time on the table.
+
+create table if not exists pns_kv (
+  key        text primary key,
+  value      text not null,
+  updated_at timestamptz not null default now()
+);
+
+-- Trigger to maintain updated_at on every UPDATE.
+create or replace function pns_kv_touch() returns trigger as $$
+begin new.updated_at = now(); return new; end;
+$$ language plpgsql;
+
+drop trigger if exists pns_kv_touch_trigger on pns_kv;
+create trigger pns_kv_touch_trigger
+  before update on pns_kv
+  for each row execute function pns_kv_touch();
+
+-- Row-level security: allow anon (the public API key) full access.
+-- This is appropriate for personal / small-team use. If you later
+-- expose this app publicly, replace these with authenticated-only
+-- policies and add Supabase Auth.
+alter table pns_kv enable row level security;
+drop policy if exists "anon read"   on pns_kv;
+drop policy if exists "anon insert" on pns_kv;
+drop policy if exists "anon update" on pns_kv;
+drop policy if exists "anon delete" on pns_kv;
+create policy "anon read"   on pns_kv for select to anon using (true);
+create policy "anon insert" on pns_kv for insert to anon with check (true);
+create policy "anon update" on pns_kv for update to anon using (true) with check (true);
+create policy "anon delete" on pns_kv for delete to anon using (true);
+
+-- Enable real-time so other devices see changes within ~1 second.
+-- Wrapped in a DO block so re-running this script doesn't error out
+-- with "table already in publication" and roll back the whole transaction.
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and tablename = 'pns_kv'
+  ) then
+    alter publication supabase_realtime add table pns_kv;
+  end if;
+end$$;`;
+
+  // Local stash of in-flight form values (so the form doesn't lose what
+  // the user typed when re-rendering for status updates).
+  if (!state._cloudForm) {
+    state._cloudForm = { url: CLOUD.url || '', anonKey: CLOUD.anonKey || '', testResult: null, busy: false, progress: null };
+  }
+  const f = state._cloudForm;
+
+  // Status badge (mirrors the topbar pill).
+  let statusBadge;
+  if (!configured)         statusBadge = `<span class="cloud-status-badge cloud-status-idle">NOT CONFIGURED</span>`;
+  else if (!enabled)       statusBadge = `<span class="cloud-status-badge cloud-status-idle">DISABLED</span>`;
+  else if (CLOUD.status === 'connecting') statusBadge = `<span class="cloud-status-badge cloud-status-sync">CONNECTING…</span>`;
+  else if (CLOUD.status === 'syncing')    statusBadge = `<span class="cloud-status-badge cloud-status-sync">SYNCING…</span>`;
+  else if (CLOUD.status === 'error')      statusBadge = `<span class="cloud-status-badge cloud-status-error">OFFLINE</span>`;
+  else if (connected)                     statusBadge = `<span class="cloud-status-badge cloud-status-ok">CONNECTED</span>`;
+  else                                    statusBadge = `<span class="cloud-status-badge cloud-status-idle">DISCONNECTED</span>`;
+
+  const lastErrorBlock = CLOUD.lastError
+    ? `<div class="notice warn" style="margin-top:12px;"><strong>Last error:</strong> ${escapeHtml(CLOUD.lastError)}</div>`
+    : '';
+  const lastSyncBlock = CLOUD.lastSyncAt
+    ? `<div class="cloud-meta">Last sync: ${new Date(CLOUD.lastSyncAt).toLocaleString()}</div>`
+    : '';
+
+  const progressBlock = f.progress
+    ? `<div class="notice" style="margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;">${escapeHtml(f.progress)}</div>`
+    : '';
+
+  root.innerHTML = `
+    <div class="main">
+      <div class="page-head">
+        <div>
+          <div class="page-title">CLOUD SYNC</div>
+          <div class="page-sub">// Sync your inventory across devices via a free Supabase project · current status: ${statusBadge} · file ${APP_VERSION}</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title">1. Set up a free Supabase project</div></div>
+        <div class="card-body">
+          <ol class="cloud-steps">
+            <li>Go to <a href="https://supabase.com/dashboard" target="_blank" rel="noopener" class="cloud-link">supabase.com/dashboard</a> and sign in (GitHub login works).</li>
+            <li>Click <strong>"New project"</strong>. Pick a name, choose a database password (you won't need it for this app — it's for direct DB access only), and pick the region closest to you.</li>
+            <li>Wait ~2 minutes for the project to spin up.</li>
+            <li>Open the <strong>SQL Editor</strong> in the left sidebar. Paste the script below and click <strong>Run</strong>.</li>
+          </ol>
+          <div class="cloud-code-head"><span>// Supabase SQL setup script — run once</span><button class="btn ghost sm" onclick="copyToClipboard(this, this.nextElementSibling.textContent)">COPY</button></div>
+          <pre class="cloud-code">${escapeHtml(sqlSetup)}</pre>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title">2. Connect this app</div></div>
+        <div class="card-body">
+          <ol class="cloud-steps">
+            <li>In your Supabase project, go to <strong>Project Settings → API</strong>.</li>
+            <li>Copy the <strong>Project URL</strong> and paste it below.</li>
+            <li>Copy the <strong>anon public</strong> key (NOT the service role key — that one stays secret) and paste it below.</li>
+          </ol>
+          <div class="form-grid" style="margin-top:12px;">
+            <div class="field full">
+              <div class="field-label-row"><label>Project URL</label></div>
+              <input type="text" id="cloudUrlInput" placeholder="https://xxx.supabase.co" value="${escapeHtml(f.url)}" oninput="state._cloudForm.url=this.value; state._cloudForm.testResult=null;" />
+            </div>
+            <div class="field full">
+              <div class="field-label-row"><label>anon public key</label></div>
+              <input type="text" id="cloudKeyInput" placeholder="eyJhbGc..." value="${escapeHtml(f.anonKey)}" oninput="state._cloudForm.anonKey=this.value; state._cloudForm.testResult=null;" style="font-family:'JetBrains Mono',monospace;font-size:11px;" />
+            </div>
+          </div>
+          <div class="btn-row" style="margin-top:14px;">
+            <button class="btn ghost" onclick="testCloudFromForm()" ${f.busy ? 'disabled' : ''}>TEST CONNECTION</button>
+            ${enabled
+              ? `<button class="btn ghost danger" onclick="disableCloud()" ${f.busy ? 'disabled' : ''}>DISABLE CLOUD SYNC</button>`
+              : `<button class="btn" onclick="enableCloudFromForm()" ${f.busy ? 'disabled' : ''}>ENABLE CLOUD SYNC →</button>`}
+          </div>
+          ${f.testResult ? `<div class="notice ${f.testResult.ok ? 'ok' : 'warn'}" style="margin-top:12px;">${f.testResult.ok ? '✓ Connection OK · table found, anon key works' : '✗ ' + escapeHtml(f.testResult.error)}</div>` : ''}
+          ${lastErrorBlock}
+        </div>
+      </div>
+
+      ${enabled ? `
+        <div class="card">
+          <div class="card-head"><div class="card-title">3. Migrate data</div></div>
+          <div class="card-body">
+            <div class="cloud-steps-prose">
+              <p><strong>First-time setup, this device has data already:</strong> click <em>Push local → cloud</em> to upload everything you have here.</p>
+              <p><strong>First-time setup, this is a new device:</strong> click <em>Pull cloud → local</em> to download whatever's already in the cloud.</p>
+              <p style="color:var(--orange);"><strong>⚠ These are one-way overwrites.</strong> "Push" replaces cloud with local; "Pull" replaces local with cloud. If both sides have data and you're not sure which is canonical, export a CSV backup of each entity first (Settings → Export Data).</p>
+            </div>
+            <div class="btn-row" style="margin-top:14px;">
+              <button class="btn" onclick="confirmPushLocalToCloud()" ${f.busy || !connected ? 'disabled' : ''}>↑ PUSH LOCAL → CLOUD</button>
+              <button class="btn" onclick="confirmPullCloudToLocal()" ${f.busy || !connected ? 'disabled' : ''}>↓ PULL CLOUD → LOCAL</button>
+            </div>
+            ${progressBlock}
+            ${lastSyncBlock}
+          </div>
+        </div>
+      ` : ''}
+
+      <div class="card">
+        <div class="card-head"><div class="card-title">How it works · gotchas</div></div>
+        <div class="card-body">
+          <ul class="cloud-gotchas">
+            <li><strong>Anon key in the HTML.</strong> Anyone with the file + key can read/write your workspace. Fine for personal or small-team use. For a public deploy you'd want to add Supabase Auth + per-user RLS — that's a bigger change.</li>
+            <li><strong>Single shared workspace.</strong> Everyone using this file shares the same data — matches the existing "team workspace" model.</li>
+            <li><strong>Offline-tolerant.</strong> Writes go to local cache first, cloud second. You can work offline; changes sync when you reconnect.</li>
+            <li><strong>Last-write-wins.</strong> Concurrent edits to the SAME record on two devices: the later write wins. For different records, both succeed cleanly thanks to real-time updates.</li>
+            <li><strong>Real-time updates.</strong> When another device writes, this device sees the change within ~1 second via Supabase Realtime.</li>
+            <li><strong>Free tier limits.</strong> Supabase free: 500MB database, 2GB bandwidth/mo. Plenty for inventory data unless you're storing very large image blobs in item records.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function testCloudFromForm() {
+  const f = state._cloudForm;
+  f.busy = true; f.testResult = null;
+  // Normalize visible input so the user sees the cleanup (catches the common
+  // "pasted /rest/v1/ by mistake" case before it confuses them).
+  const normalized = normalizeSupabaseUrl(f.url);
+  if (normalized && normalized !== f.url.trim()) f.url = normalized;
+  render();
+  const r = await testCloudConnection(normalized || f.url.trim(), f.anonKey.trim());
+  f.testResult = r;
+  f.busy = false;
+  render();
+}
+
+async function enableCloudFromForm() {
+  const f = state._cloudForm;
+  if (!f.url || !f.anonKey) { f.testResult = { ok: false, error: 'Both URL and anon key are required' }; render(); return; }
+  f.busy = true;
+  // Same normalization as the test path — store the canonical form so all
+  // downstream connectCloud / push / pull operations use it.
+  const normalized = normalizeSupabaseUrl(f.url);
+  if (normalized && normalized !== f.url.trim()) f.url = normalized;
+  render();
+  // Test first — refuse to enable a broken connection.
+  const test = await testCloudConnection(normalized, f.anonKey.trim());
+  if (!test.ok) { f.testResult = test; f.busy = false; render(); return; }
+  CLOUD.url = normalized;
+  CLOUD.anonKey = f.anonKey.trim();
+  CLOUD.enabled = true;
+  saveCloudConfigSync();
+  try {
+    await connectCloud();
+    toast('Cloud sync enabled', 'success');
+  } catch (e) {
+    f.testResult = { ok: false, error: 'Enabled but failed to subscribe to realtime: ' + e.message };
+  }
+  f.busy = false;
+  render();
+}
+
+async function disableCloud() {
+  CLOUD.enabled = false;
+  saveCloudConfigSync();
+  await disconnectCloud();
+  toast('Cloud sync disabled · local data preserved', 'success');
+  render();
+}
+
+function confirmPushLocalToCloud() {
+  showConfirmModal({
+    title: 'PUSH LOCAL → CLOUD',
+    message: `<p>This will <strong>overwrite</strong> any data already in your cloud database with what's currently on this device.</p><p style="color:var(--text-dim);font-size:12px;margin-top:10px;font-family:'JetBrains Mono',monospace;">// Use this for first-time setup when this device has the canonical data.</p>`,
+    confirmLabel: 'PUSH', confirmClass: 'danger',
+    onConfirm: async () => {
+      const f = state._cloudForm;
+      f.busy = true; f.progress = 'Starting push…'; render();
+      try {
+        const r = await pushLocalToCloud((i, n, k) => {
+          f.progress = `Pushing ${i+1}/${n}: ${k}`; render();
+        });
+        f.progress = `✓ Push complete · ${r.ok} keys pushed${r.failed ? ` · ${r.failed} failed` : ''}`;
+        toast(`Pushed ${r.ok} data set${r.ok === 1 ? '' : 's'} to cloud`, r.failed ? 'error' : 'success');
+      } catch (e) {
+        f.progress = '✗ Push failed: ' + e.message;
+        toast('Push failed: ' + e.message, 'error');
+      }
+      f.busy = false;
+      render();
+    }
+  });
+}
+
+function confirmPullCloudToLocal() {
+  showConfirmModal({
+    title: 'PULL CLOUD → LOCAL',
+    message: `<p>This will <strong>overwrite</strong> the data on this device with whatever's currently in your cloud database.</p><p style="color:var(--text-dim);font-size:12px;margin-top:10px;font-family:'JetBrains Mono',monospace;">// Use this on a new device, or to discard local changes and refresh from cloud.</p>`,
+    confirmLabel: 'PULL', confirmClass: 'danger',
+    onConfirm: async () => {
+      const f = state._cloudForm;
+      f.busy = true; f.progress = 'Starting pull…'; render();
+      try {
+        const r = await pullCloudToLocal((i, n, k) => {
+          f.progress = `Pulling ${i+1}/${n}: ${k}`; render();
+        });
+        f.progress = `✓ Pull complete · ${r.count} keys pulled · reloading…`;
+        toast(`Pulled ${r.count} data set${r.count === 1 ? '' : 's'} from cloud`, 'success');
+        // Reload everything from the (now-updated) local cache.
+        await loadAll();
+        render();
+      } catch (e) {
+        f.progress = '✗ Pull failed: ' + e.message;
+        toast('Pull failed: ' + e.message, 'error');
+      }
+      f.busy = false;
+      render();
+    }
+  });
+}
+
+/* Copy text to the clipboard with two fallbacks:
+   1. navigator.clipboard.writeText (modern, async, may reject)
+   2. document.execCommand('copy') via temporary off-screen textarea (legacy)
+   3. If both fail: select the source text in-place so the user can press
+      Ctrl/Cmd+C to copy it themselves, AND change the button label so they
+      know to do so.
+
+   The original implementation had a try/catch around an unhandled promise,
+   which meant rejected promises (the most common failure mode) silently
+   skipped the fallback. */
+function copyToClipboard(btn, text) {
+  const origLabel = btn.textContent;
+  const showCopied = () => {
+    btn.textContent = 'COPIED ✓';
+    setTimeout(() => { btn.textContent = origLabel; }, 1200);
+  };
+  const showFallback = () => {
+    btn.textContent = 'PRESS Ctrl+C / Cmd+C';
+    setTimeout(() => { btn.textContent = origLabel; }, 3500);
+    // Select the SQL block (sibling <pre>) so a manual copy works without
+    // the user having to drag-select it themselves.
+    try {
+      const codeBlock = btn.closest('.cloud-code-head')?.nextElementSibling;
+      if (codeBlock && window.getSelection) {
+        const range = document.createRange();
+        range.selectNodeContents(codeBlock);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    } catch (e) {}
+  };
+  const legacyCopy = () => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      // Off-screen but still selectable + must be in DOM
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      ta.style.top = '0';
+      ta.setAttribute('readonly', '');
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e) { return false; }
+  };
+
+  // Modern path first
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text)
+      .then(showCopied)
+      .catch(() => {
+        // Promise rejected — fall through to legacy, then manual select
+        if (legacyCopy()) showCopied(); else showFallback();
+      });
+    return;
+  }
+  // No clipboard API at all
+  if (legacyCopy()) showCopied(); else showFallback();
+}
+
+/* Single import view used by both the Items tab and the Lookups sub-tabs.
+   `target` is one of 'items' | 'sites' | 'locations' | 'categories'.
+   `backOpts` is { handler: 'fnName', label: 'List Name' } for the back button. */
+function renderImportView(root, target, backOpts) {
+  state.activeCSVTab = target;
+  const cfg = CSV_TARGETS[target];
+
+  let blockerHtml = '';
+  if (target === 'items' && (state.data.sites.length === 0 || state.data.categories.length === 0)) {
+    blockerHtml = `<div class="notice warn">// <strong>OPTIONAL DEPENDENCIES</strong> &mdash; Items can reference Categories. If you want category assignments to resolve, add them under <strong>Lookups</strong> first. Items without a category in the CSV will simply leave that field blank.</div>`;
+  } else if (target === 'locations' && state.data.sites.length === 0) {
+    blockerHtml = `<div class="notice warn">// <strong>NO SITES DEFINED</strong> &mdash; Locations belong to a site. Add at least one site before importing locations.</div>`;
+  } else if (target === 'placements' && (state.data.items.length === 0 || state.data.sites.length === 0)) {
+    blockerHtml = `<div class="notice warn">// <strong>SETUP NEEDED</strong> &mdash; Placements link an item to a site. Import items and define sites before importing placements.</div>`;
+  }
+
+  const specItems = [
+    'First row must be a header row with these column names (case-insensitive)',
+    `Required: ${cfg.requiredCols.map(c => '<strong>' + c + '</strong>').join(', ')}`
+  ];
+  if (cfg.optionalCols.length) specItems.push(`Optional: ${cfg.optionalCols.map(c => '<strong>' + c + '</strong>').join(', ')}`);
+  if (target === 'items') {
+    specItems.push('Only <strong>itemNumber</strong> is required &mdash; everything else can be blank');
+    specItems.push('If <strong>category</strong> is provided, it must match an existing category exactly');
+    specItems.push('Site and location are <em>not</em> imported here &mdash; use the Placements importer for that');
+  }
+  if (target === 'placements') {
+    specItems.push('<strong>itemNumber</strong> must match an existing item (import items first)');
+    specItems.push('<strong>site</strong> must match an existing site exactly (case-insensitive)');
+    specItems.push('<strong>location</strong>, if provided, must match a location at the named site');
+    specItems.push('<strong style="color:var(--green);">Duplicates are never flagged</strong> &mdash; the same item can be placed at the same site/location multiple times');
+  }
+  if (target === 'locations')  specItems.push('<strong style="color:var(--orange);">Note:</strong> the <strong>site</strong> value must match an existing site under <strong>Lookups &rarr; Sites</strong> exactly (case-insensitive)');
+  if (target === 'sites' || target === 'categories') specItems.push('Names matching existing records (case-insensitive) are skipped as duplicates');
+  if (target === 'customers') {
+    specItems.push('Customer names matching existing records (case-insensitive) are skipped as duplicates');
+    specItems.push('When provided, <strong>email</strong> and <strong>website</strong> values are format-checked');
+  }
+
+  root.innerHTML = `
+    <div class="page-head">
+      <div>
+        <div class="page-title">IMPORT ${cfg.label.toUpperCase()}</div>
+        <div class="page-sub">// ${cfg.description}</div>
+      </div>
+      ${backOpts ? `<button class="btn ghost" onclick="${backOpts.handler}()">&larr; Back to ${escapeHtml(backOpts.label)}</button>` : ''}
+    </div>
+
+    ${blockerHtml}
+
+    <div class="card">
+      <div class="card-head"><div class="card-title">${cfg.label} CSV Format</div></div>
+      <div class="card-body">
+        <ul class="csv-spec">
+          ${specItems.map(s => '<li>' + s + '</li>').join('')}
+        </ul>
+        <div class="code-block">${escapeHtml(cfg.sample)}</div>
+        <div style="margin-top:14px;">
+          <button class="btn ghost sm" onclick="downloadTemplate()">&darr; Download Template</button>
+          <button class="btn ghost sm" onclick="downloadSample()">&darr; Download Sample</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><div class="card-title">Upload File</div></div>
+      <div class="card-body">
+        <div class="dropzone" id="csvDrop" onclick="document.getElementById('csvFile').click()" ondragover="event.preventDefault();this.classList.add('drag');" ondragleave="this.classList.remove('drag');" ondrop="handleCSVDrop(event)">
+          <div class="dropzone-icon">&uarr;</div>
+          <div class="dropzone-title">DROP ${cfg.label.toUpperCase()} CSV HERE OR CLICK TO BROWSE</div>
+          <div class="dropzone-sub">// .csv files only &middot; uploads previewed before commit</div>
+        </div>
+        <input type="file" id="csvFile" accept=".csv,text/csv" onchange="handleCSVFile(event)" />
+      </div>
+    </div>
+
+    ${state.csvPreview && state.csvPreview.target === target ? renderCSVPreview() : ''}`;
+}
+
+function downloadTemplate() {
+  const cfg = CSV_TARGETS[state.activeCSVTab];
+  downloadCSV(cfg.headerLine + '\n', `${cfg.entity}-template.csv`);
+}
+function downloadSample() {
+  const cfg = CSV_TARGETS[state.activeCSVTab];
+  downloadCSV(cfg.sample + '\n', `${cfg.entity}-sample.csv`);
+}
+function downloadCSV(csv, filename) {
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+
+function handleCSVDrop(e) { e.preventDefault(); e.currentTarget.classList.remove('drag'); const file = e.dataTransfer.files[0]; if (file) processCSVFile(file); }
+function handleCSVFile(e) { const file = e.target.files[0]; if (file) processCSVFile(file); }
+
+function processCSVFile(file) {
+  if (!file.name.toLowerCase().endsWith('.csv')) { toast('Please upload a .csv file', 'error'); return; }
+  const target = state.activeCSVTab;
+  const cfg = CSV_TARGETS[target];
+  const reader = new FileReader();
+  reader.onload = ev => {
+    try {
+      const rows = parseCSV(ev.target.result);
+      if (rows.length < 2) { toast('CSV is empty or has no data rows', 'error'); return; }
+      const header = rows[0].map(h => h.trim().toLowerCase());
+      const missing = cfg.requiredCols.filter(c => !header.includes(c));
+      if (missing.length) { toast('Missing required columns: ' + missing.join(', '), 'error'); return; }
+
+      const preview = [];
+      const seenInFile = new Set();
+      for (let r = 1; r < rows.length; r++) {
+        const row = rows[r];
+        if (row.every(c => !c || !c.trim())) continue;
+        const get = name => { const i = header.indexOf(name.toLowerCase()); return i >= 0 ? (row[i]||'').trim() : ''; };
+        const result = cfg.parseRow(get, seenInFile);
+        preview.push({ row: r+1, ...result.data, status: result.status, reason: result.reason });
+      }
+      state.csvPreview = { filename: file.name, rows: preview, target };
+      render();
+    } catch (err) { toast('Failed to parse CSV: ' + err.message, 'error'); }
+  };
+  reader.readAsText(file);
+}
+
+function parseCSV(text) {
+  const rows = []; let cur = ['']; let col = 0; let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') { if (text[i+1] === '"') { cur[col] += '"'; i++; } else inQuotes = false; }
+      else cur[col] += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ',') { col++; cur[col] = ''; }
+      else if (c === '\n' || c === '\r') {
+        if (c === '\r' && text[i+1] === '\n') i++;
+        rows.push(cur); cur = ['']; col = 0;
+      } else cur[col] += c;
+    }
+  }
+  if (cur.length > 1 || cur[0] !== '') rows.push(cur);
+  return rows;
+}
+
+function renderCSVPreview() {
+  const p = state.csvPreview;
+  const cfg = CSV_TARGETS[p.target];
+  const ok  = p.rows.filter(r => r.status==='ok').length;
+  const dup = p.rows.filter(r => r.status==='dup').length;
+  const err = p.rows.filter(r => r.status==='err').length;
+  return `
+    <div class="card">
+      <div class="card-head"><div class="card-title">Preview · ${cfg.label} · ${escapeHtml(p.filename)}</div><button class="btn ghost sm" onclick="state.csvPreview=null; render();">CLEAR</button></div>
+      <div class="card-body">
+        <div class="preview-summary">
+          <div class="preview-stat"><div class="preview-stat-num" style="color:var(--green)">${ok}</div><div class="preview-stat-label">Ready to import</div></div>
+          <div class="preview-stat dup"><div class="preview-stat-num" style="color:var(--red)">${dup}</div><div class="preview-stat-label">Duplicates (skipped)</div></div>
+          <div class="preview-stat err"><div class="preview-stat-num" style="color:var(--orange)">${err}</div><div class="preview-stat-label">Errors (skipped)</div></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>#</th><th>Status</th>${cfg.previewCols.map(c => `<th>${c.label}</th>`).join('')}<th>Notes</th></tr></thead>
+            <tbody>
+              ${p.rows.map(r => `
+                <tr>
+                  <td class="mono" style="color:var(--text-faint)">${r.row}</td>
+                  <td><span class="badge ${r.status==='ok'?'green':r.status==='dup'?'red':'orange'}">${r.status === 'ok' ? 'OK' : r.status === 'dup' ? 'DUPLICATE' : 'ERROR'}</span></td>
+                  ${cfg.previewCols.map(c => `<td>${c.render(r)}</td>`).join('')}
+                  <td class="mono" style="font-size:11px;color:${r.status==='dup'?'var(--red)':r.status==='err'?'var(--orange)':'var(--text-dim)'}">${escapeHtml(r.reason||'')}</td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+        <div class="btn-row">
+          <button class="btn" onclick="commitCSV()" ${ok===0?'disabled':''}>Import ${ok} ${cfg.label} →</button>
+          <button class="btn ghost" onclick="state.csvPreview=null; render();">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function commitCSV() {
+  const p = state.csvPreview; if (!p) return;
+  const cfg = CSV_TARGETS[p.target];
+  const ok = p.rows.filter(r => r.status === 'ok');
+  const dup = p.rows.filter(r => r.status === 'dup');
+  if (!ok.length) return;
+  cfg.commit(ok);
+  await saveType(cfg.entity);
+  logAction('CSV_IMPORT', cfg.entity, null, `Imported ${ok.length} ${cfg.label.toLowerCase()} from ${p.filename}`);
+  if (dup.length) logAction('CSV_DUPLICATE_SKIP', cfg.entity, null, `Skipped ${dup.length} duplicate(s) from ${p.filename}`);
+  toast(`Imported ${ok.length} ${cfg.label.toLowerCase()}${dup.length?'  ·  '+dup.length+' duplicates skipped':''}`, 'success');
+  state.csvPreview = null;
+  // All imports flow through Settings → Import Data, so return to the hub
+  // regardless of which entity was just committed.
+  state.settingsView = 'hub';
+  render();
+}
+
+/* ============ ACTIONS ============
+   Each action is a guided form that mutates state.data.placements and
+   appends a structured record to state.actionLog. Direct placement
+   editing is intentionally absent — actions are the only path. */
+
+const ACTION_DEFS = {
+  add:    { title: 'ADD STOCK',       sub: 'Increase quantity at a site/location · creates a placement if none exists',         verb: 'Add',     successVerb: 'added',     color: 'var(--green)' },
+  remove: { title: 'REMOVE STOCK',    sub: 'Decrease quantity at a site/location · placement is deleted if it reaches zero',    verb: 'Remove',  successVerb: 'removed',   color: 'var(--orange)' },
+  adjust: { title: 'ADJUST STOCK',    sub: 'Set the exact quantity at a site/location · overrides current value',                verb: 'Adjust',  successVerb: 'adjusted',  color: 'var(--cyan)' },
+  move:   { title: 'MOVE STOCK',      sub: 'Atomic transfer from one site/location to another · same item, same quantity',      verb: 'Move',    successVerb: 'moved',     color: 'var(--amber)' }
+};
+
+/* ============ v66 — SIMPLE VIEW SHELL ============
+   Top tab bar (ACTIONS + ITEM SEARCH) plus the active tab's content.
+   ACTIONS reuses the existing renderActionForm / renderActionHistory
+   functions verbatim — Simple mode is purely a layout switcher, not a
+   feature rewrite. ITEM SEARCH is brand new (renderItemSearchCards).
+   v68: SETTINGS now renders inside the shell too, so the tab bar is
+   always visible and the user can always tap ACTIONS or ITEM SEARCH
+   to leave the settings page. The settings sub-views (Theme, View Mode,
+   Cloud Sync, Logo, Import) accept any root element to render into, so
+   we just pipe them into the simple-tab-content div. */
+function renderSimpleShell(root) {
+  const activeTab = state.activeTab;
+  // Tab bar shows ACTIONS / ITEM SEARCH active state based on activeTab.
+  // When on Settings (activeTab === 'settings'), neither button shows as
+  // active — visual cue that the user is in a sub-view that's not one of
+  // the two primary tabs. Tapping either button leaves settings.
+  const activeSimpleTab = activeTab === 'itemSearch' ? 'itemSearch'
+                        : activeTab === 'actions'    ? 'actions'
+                        : null; // settings or other → no active highlight
+  state.activeSimpleTab = activeSimpleTab || state.activeSimpleTab || 'actions';
+  // v68: when on settings, also show a small "SETTINGS" label so the user
+  // sees where they are in addition to the tab bar.
+  const settingsCrumb = activeTab === 'settings'
+    ? `<div class="simple-settings-crumb">// IN SETTINGS · tap a tab above to exit</div>`
+    : '';
+  root.innerHTML = `
+    <div class="simple-shell">
+      <div class="simple-tab-bar">
+        <button class="${activeSimpleTab === 'actions'    ? 'is-active' : ''}" onclick="setSimpleTab('actions')">ACTIONS</button>
+        <button class="${activeSimpleTab === 'itemSearch' ? 'is-active' : ''}" onclick="setSimpleTab('itemSearch')">ITEM SEARCH</button>
+      </div>
+      ${settingsCrumb}
+      <div class="simple-tab-content" id="simpleTabContent"></div>
+    </div>`;
+  const content = document.getElementById('simpleTabContent');
+  if (activeTab === 'itemSearch') {
+    renderItemSearchCards(content);
+  } else if (activeTab === 'settings') {
+    // Dispatch the same settings sub-view renderers used by the regular
+    // (non-simple) flow. They all take a root element and render into it.
+    if (state.settingsView === 'import') {
+      renderImportView(content, state.activeCSVTab, { handler: 'returnToImportHub', label: 'Import Hub' });
+    } else if (state.settingsView === 'theme') {
+      renderThemeView(content);
+    } else if (state.settingsView === 'viewMode') {
+      renderViewModeView(content);
+    } else if (state.settingsView === 'cloudSync') {
+      renderCloudSyncView(content);
+    } else if (state.settingsView === 'logo') {
+      renderLogoView(content);
+    } else {
+      renderImportHub(content);
+    }
+  } else {
+    // ACTIONS — see renderSimpleActionsTab.
+    renderSimpleActionsTab(content);
+  }
+}
+
+function setSimpleTab(tab) {
+  if (tab !== 'actions' && tab !== 'itemSearch') return;
+  state.activeTab = tab;
+  state.activeSimpleTab = tab;
+  render();
+}
+
+/* Renders the Actions tab inside the Simple shell. Same content as the
+   non-simple actions tab: an inline mini-nav (add/remove/adjust/move/
+   history) plus the active form. Self-contained so the simple shell
+   doesn't need to mount a secondary tab bar in the page-head layout. */
+function renderSimpleActionsTab(root) {
+  const tabs = [
+    { key: 'add',     label: 'Add' },
+    { key: 'remove',  label: 'Remove' },
+    { key: 'adjust',  label: 'Adjust' },
+    { key: 'move',    label: 'Move' },
+    { key: 'history', label: 'History' }
+  ];
+  const active = state.activeActionsTab || 'add';
+  const navHtml = `
+    <div class="simple-actions-nav" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;">
+      ${tabs.map(t => `
+        <button class="btn ${active === t.key ? '' : 'ghost'} sm" onclick="state.activeActionsTab='${t.key}'; render();">
+          ${t.label}
+        </button>`).join('')}
+    </div>`;
+  // Render the nav header, then a host div for the form/history content,
+  // then dispatch the renderer.
+  root.innerHTML = navHtml + '<div id="simpleActionsBody"></div>';
+  const body = document.getElementById('simpleActionsBody');
+  if (active === 'history') renderActionHistory(body);
+  else                       renderActionForm(body, active);
+}
+
+/* The ITEM SEARCH tab. A focused search input + card grid below.
+   - Type a query → live filter against item number / name / category
+   - Tap the input → search-scan floater appears (per v61), tap it to
+     open the camera scanner; on scan, the input populates with the
+     barcode and results update.
+   - Working-site scope applies (items with at least one placement in
+     scope are shown). With no scope set, all items are searchable.
+   - Empty query shows a guidance state instead of dumping the whole
+     catalog. */
+function renderItemSearchCards(root) {
+  const q = (state.simpleSearch || '').trim().toLowerCase();
+  const scopeIds = workingSiteSetPruned();
+  const useScope = scopeIds && scopeIds.size > 0;
+  // Build a candidate set: items in scope (if any), else all items.
+  let candidates;
+  if (useScope) {
+    const inScope = new Set(
+      state.data.placements.filter(p => scopeIds.has(p.siteId)).map(p => p.itemId)
+    );
+    candidates = state.data.items.filter(i => inScope.has(i.id));
+  } else {
+    candidates = state.data.items;
+  }
+  // Filter by query if non-empty. Match against item number, name, and
+  // category name (loose substring, case-insensitive). Empty query
+  // shows everything in scope (or all items if no scope) so the user
+  // can browse.
+  let matches;
+  if (q.length === 0) {
+    matches = candidates;
+  } else {
+    const catById = new Map(state.data.categories.map(c => [c.id, c]));
+    matches = candidates.filter(i => {
+      if ((i.itemNumber || '').toLowerCase().includes(q)) return true;
+      if ((i.name || '').toLowerCase().includes(q))       return true;
+      const c = catById.get(i.categoryId);
+      if (c && (c.name || '').toLowerCase().includes(q))  return true;
+      return false;
+    });
+  }
+  // Sort: by name (then item #) for predictability.
+  matches.sort((a, b) =>
+    (a.name || '').localeCompare(b.name || '') ||
+    (a.itemNumber || '').localeCompare(b.itemNumber || '')
+  );
+  // Cap the displayed results so a giant catalog doesn't render 10k cards
+  // at once. The user can refine with search to narrow.
+  const RESULT_CAP = 60;
+  const truncated = matches.length > RESULT_CAP;
+  const visible = truncated ? matches.slice(0, RESULT_CAP) : matches;
+  const headerText = q.length === 0
+    ? (useScope
+        ? `// BROWSE · ${matches.length} item${matches.length === 1 ? '' : 's'} in scope`
+        : `// BROWSE · ${matches.length} item${matches.length === 1 ? '' : 's'}`)
+    : `// FOUND ${matches.length} item${matches.length === 1 ? '' : 's'}${truncated ? ` (showing first ${RESULT_CAP})` : ''}`;
+  const cards = visible.map(i => renderPokemonCard(i, useScope ? scopeIds : null)).join('');
+  const grid = matches.length > 0
+    ? `<div class="simple-card-grid">${cards}</div>${truncated ? `<div class="simple-empty"><div>Refine your search to see additional items.</div></div>` : ''}`
+    : `<div class="simple-empty">
+         <div>No items match.</div>
+         <div class="simple-empty-hint">${q.length === 0 ? '// Add items via the desktop view first' : '// Try a different query · scan a barcode · clear search'}</div>
+       </div>`;
+  root.innerHTML = `
+    <div class="simple-search-bar">
+      <input class="search mono-input" placeholder="Search by name, item #, or category…"
+             value="${escapeHtml(state.simpleSearch || '')}"
+             oninput="state.simpleSearch=this.value; refreshSimpleSearch();"
+             onfocus="onSearchInputFocus('items')"
+             onblur="onSearchInputBlur()" />
+      ${q.length > 0 ? `<button class="btn ghost sm" onclick="state.simpleSearch=''; render();">CLEAR</button>` : ''}
+    </div>
+    <div class="simple-results-header">${headerText}</div>
+    ${grid}`;
+}
+
+/* Renders a single Pokémon-style card for an item. Computes status,
+   total qty, and category at render time. Clicking the card opens
+   the item's edit form — the same affordance as tapping an item # in
+   the regular list. */
+function renderPokemonCard(item, scopeIds) {
+  const useScope = scopeIds && scopeIds.size > 0;
+  const totalQty = useScope ? totalQtyForItemInScope(item.id, scopeIds) : totalQtyForItem(item.id);
+  const placementsCount = state.data.placements.filter(p =>
+    p.itemId === item.id && (!useScope || scopeIds.has(p.siteId))
+  ).length;
+  const min = (item.minStock != null && item.minStock !== '') ? Number(item.minStock) : null;
+  // Status classification: OOS / Low / In Stock. Mirrors isLowStock + the
+  // qty=0 check used elsewhere.
+  let statusLabel, statusClass, badgeClass;
+  if (totalQty <= 0) { statusLabel = 'Out of Stock'; statusClass = 'is-out-of-stock'; badgeClass = 'is-oos'; }
+  else if (min != null && min > 0 && totalQty < min) { statusLabel = 'Low Stock'; statusClass = 'is-low-stock'; badgeClass = 'is-low'; }
+  else { statusLabel = 'In Stock'; statusClass = 'is-in-stock'; badgeClass = ''; }
+  // Category lookup. Falls back to "—" when missing or category was deleted.
+  const cat = item.categoryId
+    ? state.data.categories.find(c => c.id === item.categoryId)
+    : null;
+  const catName = cat ? cat.name : '—';
+  // Art panel: real image if present, else a stylized placeholder that
+  // uses the first two characters of the item number as a callsign.
+  const artHtml = item.image
+    ? `<img src="${escapeHtml(item.image)}" alt="${escapeHtml(item.name || item.itemNumber || '')}">`
+    : `<span class="pc-art-placeholder">${escapeHtml((item.itemNumber || '??').slice(0, 2).toUpperCase())}</span>`;
+  // Prices — display "—" when not set so the stats row stays uniform.
+  const fmtPrice = v => (v != null && v !== '' && !isNaN(Number(v)))
+    ? '$' + Number(v).toFixed(2)
+    : '<span style="color:var(--text-faint);">—</span>';
+  return `
+    <div class="pokemon-card is-clickable" role="button" tabindex="0"
+         onclick="openForm('items','${item.id}')"
+         onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openForm('items','${item.id}');}"
+         title="${escapeHtml((item.name || item.itemNumber || '') + ' · click to edit')}">
+      <div class="pc-header">
+        <div class="pc-name">${escapeHtml(item.name || '(unnamed)')}</div>
+        <div class="pc-qty-badge ${badgeClass}">${totalQty}</div>
+      </div>
+      <div class="pc-itemnumber">#${escapeHtml(item.itemNumber || '—')}</div>
+      <div class="pc-art">${artHtml}</div>
+      <div class="pc-category">TYPE · <strong>${escapeHtml(catName)}</strong></div>
+      <div class="pc-stats">
+        <div class="pc-stat">
+          <div class="pc-stat-label">Cost</div>
+          <div class="pc-stat-value">${fmtPrice(item.cost)}</div>
+        </div>
+        <div class="pc-stat">
+          <div class="pc-stat-label">List</div>
+          <div class="pc-stat-value">${fmtPrice(item.listPrice)}</div>
+        </div>
+        <div class="pc-stat">
+          <div class="pc-stat-label">Sales</div>
+          <div class="pc-stat-value">${fmtPrice(item.salesPrice)}</div>
+        </div>
+      </div>
+      <div class="pc-footer">
+        <span class="pc-footer-placements">▸ ${placementsCount} placement${placementsCount === 1 ? '' : 's'}</span>
+        <span class="pc-footer-status ${statusClass}">● ${statusLabel.toUpperCase()}</span>
+      </div>
+    </div>`;
+}
+
+/* Lightweight refresh for the simple-search input — re-renders only the
+   tab content (not the whole shell + topbar), so the keyboard stays up
+   on mobile as the user types. */
+function refreshSimpleSearch() {
+  const c = document.getElementById('simpleTabContent');
+  if (c) renderItemSearchCards(c);
+}
+
+function renderActionForm(root, type) {
+  const def = ACTION_DEFS[type];
+  if (!def) { root.innerHTML = ''; return; }
+
+  const items = [...state.data.items].sort((a,b) => a.itemNumber.localeCompare(b.itemNumber));
+  const sites = [...state.data.sites].sort((a,b) => a.name.localeCompare(b.name));
+
+  // Setup blockers — actions need at least one item and one site (with a location somewhere).
+  if (items.length === 0) {
+    root.innerHTML = renderActionBlocker(def, 'No items yet. Create one in <strong>Items → Add Item</strong> first.');
+    return;
+  }
+  if (sites.length === 0 || state.data.locations.length === 0) {
+    root.innerHTML = renderActionBlocker(def, 'Actions need both a site and a location. Create them in <strong>Lookups → Sites / Locations</strong> first.');
+    return;
+  }
+
+  // For Remove / Adjust / Move, the source must be an existing placement.
+  // For Add, the user picks any (item, site, location) — we'll create a placement if needed.
+  const isMove = type === 'move';
+  const sourceFromPlacement = type !== 'add';
+
+  root.innerHTML = `
+    <div class="page-head">
+      <div>
+        <div class="page-title">${def.title}</div>
+        <div class="page-sub">// ${def.sub}</div>
+      </div>
+      <div class="page-sub">// Operator: ${escapeHtml(state.user.firstName + ' ' + state.user.lastName)}</div>
+    </div>
+    <div class="card">
+      <div class="card-body" style="padding:24px;">
+        <form id="actionForm" onsubmit="submitActionForm(event, '${type}')">
+          <div class="form-grid">
+            ${renderActionItemPicker(sourceFromPlacement)}
+            ${isMove ? `
+              <div class="field full"><div class="field-label-row"><label>FROM</label><span class="req-badge">REQUIRED</span></div></div>
+              ${renderActionLocationPicker('from', true)}
+              <div class="field full"><div class="field-label-row"><label>TO</label><span class="req-badge">REQUIRED</span></div></div>
+              ${renderActionLocationPicker('to', false)}
+            ` : `
+              ${renderActionLocationPicker('', sourceFromPlacement)}
+            `}
+            ${renderActionQuantityField(type)}
+            <div class="field full">
+              <div class="field-label-row"><label>Notes</label><span class="opt-badge">OPTIONAL</span></div>
+              <input type="text" name="notes" placeholder="e.g. PO #4521, restock, damaged unit, etc.">
+            </div>
+          </div>
+          <div class="field-error" id="actionError" style="margin-top:10px; min-height:18px;"></div>
+          <div class="btn-row">
+            <button type="submit" class="btn">${def.verb.toUpperCase()} →</button>
+            <button type="button" class="btn ghost" onclick="resetActionForm()">CLEAR</button>
+          </div>
+        </form>
+        ${renderActionContextPanel(type)}
+      </div>
+    </div>`;
+
+  setTimeout(() => {
+    const f = document.querySelector('#actionForm input[name=itemId]');
+    if (f) f.focus();
+  }, 50);
+}
+
+function renderActionBlocker(def, message) {
+  return `
+    <div class="page-head">
+      <div>
+        <div class="page-title">${def.title}</div>
+        <div class="page-sub">// ${def.sub}</div>
+      </div>
+    </div>
+    <div class="notice warn">// <strong>SETUP NEEDED</strong> — ${message}</div>`;
+}
+
+function renderActionItemPicker(sourceFromPlacement) {
+  // For source-from-placement actions, only show items that have at least one placement.
+  let items = [...state.data.items];
+  if (sourceFromPlacement) {
+    const itemsWithPlacements = new Set(state.data.placements.map(p => p.itemId));
+    items = items.filter(i => itemsWithPlacements.has(i.id));
+  }
+  items.sort((a,b) => a.itemNumber.localeCompare(b.itemNumber));
+  const help = sourceFromPlacement ? 'Only items with existing stock are listed' : '';
+
+  /* v54 (Item 1): converted from <select> to <input list> + <datalist>.
+     The user can type freely; suggestions match against item number AND
+     name because we encode both into the option value ("PEN-001 — Pencil").
+     resolveItemByText handles all three input forms on submit:
+       · plain item number ("PEN-001")
+       · full datalist pick     ("PEN-001 — Pencil")
+       · plain item name        ("Pencil") */
+  const optionsHtml = items.length === 0
+    ? ''
+    : items.map(i => {
+        const label = i.name ? `${i.itemNumber} — ${i.name}` : i.itemNumber;
+        return `<option value="${escapeHtml(label)}"></option>`;
+      }).join('');
+  const placeholder = items.length === 0 ? 'No eligible items' : 'Type item # or name…';
+  return `
+    <div class="field full">
+      <div class="field-label-row"><label>Item</label><span class="req-badge">REQUIRED</span></div>
+      <input type="text" name="itemId" class="required-input" required
+             list="actionItemsList" autocomplete="off"
+             placeholder="${escapeHtml(placeholder)}"
+             ${items.length === 0 ? 'disabled' : ''}
+             onchange="onActionItemChange(this.value)">
+      <datalist id="actionItemsList">${optionsHtml}</datalist>
+      ${help ? `<div class="field-help">// ${help}</div>` : ''}
+    </div>`;
+}
+
+function renderActionLocationPicker(prefix, restrictToExisting) {
+  // prefix is '' for single-location actions, 'from' or 'to' for move.
+  const sitePrefix = prefix ? prefix + 'SiteId' : 'siteId';
+  const locPrefix  = prefix ? prefix + 'LocationId' : 'locationId';
+  const labelPrefix = prefix ? prefix.charAt(0).toUpperCase() + prefix.slice(1) + ' ' : '';
+  /* v54 (Item 1): same pattern as the item picker — text + datalist for
+     both site and location. The datalist <option> tags are populated by
+     populateSiteDatalist / populateLocationDatalist as the user picks
+     upstream values (item then site). Until populated, the datalists are
+     empty — the user still gets a usable text field, just no suggestions. */
+  return `
+    <div class="field">
+      <div class="field-label-row"><label>${labelPrefix}Site</label><span class="req-badge">REQUIRED</span></div>
+      <input type="text" name="${sitePrefix}" class="required-input" required
+             list="action${escapeHtml(sitePrefix)}List" autocomplete="off"
+             placeholder="${restrictToExisting ? 'Pick an item first' : 'Type site name…'}"
+             ${restrictToExisting ? 'disabled' : ''}
+             onchange="onActionSiteChange('${prefix}', this.value, ${restrictToExisting})">
+      <datalist id="action${escapeHtml(sitePrefix)}List"></datalist>
+      ${restrictToExisting ? `<div class="field-help">// Only sites with existing stock for this item</div>` : ''}
+    </div>
+    <div class="field">
+      <div class="field-label-row"><label>${labelPrefix}Location</label><span class="req-badge">REQUIRED</span></div>
+      <input type="text" name="${locPrefix}" class="required-input" required
+             list="action${escapeHtml(locPrefix)}List" autocomplete="off"
+             placeholder="Pick a site first"
+             disabled>
+      <datalist id="action${escapeHtml(locPrefix)}List"></datalist>
+    </div>`;
+}
+
+function renderActionQuantityField(type) {
+  const labels = {
+    add:    { label: 'Quantity to Add',      ph: 'e.g. 5',  help: 'Positive number · adds to current stock' },
+    remove: { label: 'Quantity to Remove',   ph: 'e.g. 5',  help: 'Cannot exceed current quantity at the location' },
+    adjust: { label: 'New Quantity',          ph: 'e.g. 24', help: 'Sets the exact quantity at this location, regardless of what was there' },
+    move:   { label: 'Quantity to Move',      ph: 'e.g. 5',  help: 'Cannot exceed current quantity at the source' }
+  };
+  const l = labels[type] || labels.add;
+  return `
+    <div class="field full">
+      <div class="field-label-row"><label>${l.label}</label><span class="req-badge">REQUIRED</span></div>
+      <input type="number" name="quantity" min="0" step="1" class="required-input mono-input" required placeholder="${l.ph}">
+      <div class="field-help">// ${l.help}</div>
+    </div>`;
+}
+
+/* Live updates when the operator changes the item or site fields.
+   Without these, the location field would either offer invalid choices
+   or stay empty. v54: works with input+datalist fields — resolves the
+   typed text to a real entity (or null if no match) before cascading
+   to the next field. */
+function onActionItemChange(itemText) {
+  const form = document.getElementById('actionForm'); if (!form) return;
+  const type = state.activeActionsTab;
+  const isMove = type === 'move';
+  // Resolve typed text → item record. Empty / unresolved → cascading
+  // fields lock themselves (see populateSiteDatalist's restrict branch).
+  const item = resolveItemByText(itemText);
+  const itemId = item ? item.id : '';
+  if (isMove) {
+    populateSiteDatalist(form.querySelector('input[name=fromSiteId]'), itemId, true);
+    populateSiteDatalist(form.querySelector('input[name=toSiteId]'),   itemId, false);
+  } else {
+    const restrict = type !== 'add';
+    populateSiteDatalist(form.querySelector('input[name=siteId]'), itemId, restrict);
+  }
+  // Reset all location inputs since the item changed.
+  form.querySelectorAll('input[name$=LocationId], input[name=locationId]').forEach(input => resetLocationInput(input));
+}
+
+function onActionSiteChange(prefix, siteText, restrictToExisting) {
+  const form = document.getElementById('actionForm'); if (!form) return;
+  const itemInput = form.querySelector('input[name=itemId]');
+  const itemText = itemInput ? itemInput.value : '';
+  const item = resolveItemByText(itemText);
+  const itemId = item ? item.id : '';
+  const site = resolveSiteByText(siteText);
+  const siteId = site ? site.id : '';
+  const locName = prefix ? prefix + 'LocationId' : 'locationId';
+  const locInput = form.querySelector(`input[name=${locName}]`);
+  populateLocationDatalist(locInput, siteId, itemId, restrictToExisting);
+}
+
+/* v54 (Item 1): resolve helpers — convert typed text back to a real
+   entity. Used by the action form change handlers and submitActionForm.
+   resolveItemByText handles three input forms gracefully:
+     · plain item number      ("PEN-001")
+     · datalist-pick combo    ("PEN-001 — Pencil")
+     · plain item name        ("Pencil")
+   Site / Location resolution is by name; for locations, an optional
+   siteId scopes the lookup so two locations with the same name at
+   different sites don't collide. */
+/* v70: helper used by all three resolvers below. Tries (in order):
+     1. exact case-insensitive match on the selector
+     2. unique prefix match (only one record starts with the typed text)
+     3. unique contains match (only one record contains the typed text)
+   Returns the matched record, or null on no-match / ambiguous match.
+   Ambiguity safety is deliberate — silently picking one of several
+   plausible matches leads to subtle wrong-record bugs. */
+function _resolveByTextWithFallback(records, getName, text, additionalFilter) {
+  if (!text || !records || records.length === 0) return null;
+  const t = String(text).trim();
+  if (!t) return null;
+  const tLower = t.toLowerCase();
+  const filtered = additionalFilter ? records.filter(additionalFilter) : records;
+  // 1: exact (case-insensitive)
+  const exact = filtered.find(r => (getName(r) || '').toLowerCase() === tLower);
+  if (exact) return exact;
+  // 2: unique prefix
+  const prefixMatches = filtered.filter(r => (getName(r) || '').toLowerCase().startsWith(tLower));
+  if (prefixMatches.length === 1) return prefixMatches[0];
+  // 3: unique contains
+  const containsMatches = filtered.filter(r => (getName(r) || '').toLowerCase().includes(tLower));
+  if (containsMatches.length === 1) return containsMatches[0];
+  return null;
+}
+
+function resolveItemByText(text) {
+  if (!text) return null;
+  const t = String(text).trim();
+  const tLower = t.toLowerCase();
+  // Direct itemNumber match (case-insensitive). Item numbers are stable
+  // identifiers — keep the strict path for them.
+  let item = state.data.items.find(i => i.itemNumber.toLowerCase() === tLower);
+  if (item) return item;
+  // "ITEM-NUM — Name" datalist pick
+  const sep = t.indexOf(' — ');
+  if (sep > 0) {
+    const num = t.slice(0, sep).trim().toLowerCase();
+    item = state.data.items.find(i => i.itemNumber.toLowerCase() === num);
+    if (item) return item;
+  }
+  // Plain name match — exact, then unique prefix, then unique contains.
+  // v70: relaxed from exact-only so typing "Pen" finds "Pencil" if it's
+  // unique. Ambiguous typings (e.g. "Pen" matching both "Pencil" and
+  // "Pen Cap") return null so the user is prompted to be more specific.
+  item = _resolveByTextWithFallback(state.data.items, r => r.name, t);
+  return item || null;
+}
+function resolveSiteByText(text) {
+  // v70: relaxed from exact-only. Typing "Wareh" now resolves to "Main
+  // Warehouse" if it's the only site starting with that prefix.
+  return _resolveByTextWithFallback(state.data.sites, r => r.name, text);
+}
+function resolveLocationByText(text, siteId) {
+  // v70: same fuzzy fallback as sites, scoped to the given siteId when
+  // provided (so "Bin 3" at Yard doesn't collide with "Bin 3" at LHD).
+  return _resolveByTextWithFallback(
+    state.data.locations,
+    r => r.name,
+    text,
+    siteId ? (r => r.siteId === siteId) : null
+  );
+}
+
+/* Reset a location <input list> to disabled / empty state. Mirrors the
+   old "select with disabled='select a site first' option" reset. */
+function resetLocationInput(input) {
+  if (!input) return;
+  input.value = '';
+  input.disabled = true;
+  input.placeholder = 'Pick a site first';
+  const listId = input.getAttribute('list');
+  const dl = listId ? document.getElementById(listId) : null;
+  if (dl) dl.innerHTML = '';
+}
+
+function populateSiteDatalist(input, itemId, restrictToExisting) {
+  if (!input) return;
+  const listId = input.getAttribute('list');
+  const dl = listId ? document.getElementById(listId) : null;
+  // restrictToExisting (Remove / Adjust / Move-from) needs an item resolved
+  // to know which sites are eligible. Without one, lock the input rather
+  // than dumping every site into the suggestions.
+  if (restrictToExisting && !itemId) {
+    if (dl) dl.innerHTML = '';
+    input.value = '';
+    input.disabled = true;
+    input.placeholder = 'Pick an item first';
+    return;
+  }
+  let sites = [...state.data.sites];
+  if (restrictToExisting && itemId) {
+    const sitesWithItem = new Set(state.data.placements.filter(p => p.itemId === itemId).map(p => p.siteId));
+    sites = sites.filter(s => sitesWithItem.has(s.id));
+  }
+  sites.sort((a, b) => a.name.localeCompare(b.name));
+  if (dl) dl.innerHTML = sites.map(s => `<option value="${escapeHtml(s.name)}"></option>`).join('');
+  input.disabled = sites.length === 0;
+  input.placeholder = sites.length === 0 ? 'No eligible sites' : 'Type site name…';
+  // If the current typed value no longer matches a valid option, clear it.
+  if (input.value && !sites.find(s => s.name.toLowerCase() === input.value.trim().toLowerCase())) {
+    input.value = '';
+  }
+}
+
+function populateLocationDatalist(input, siteId, itemId, restrictToExisting) {
+  if (!input) return;
+  const listId = input.getAttribute('list');
+  const dl = listId ? document.getElementById(listId) : null;
+  if (!siteId) {
+    if (dl) dl.innerHTML = '';
+    input.value = '';
+    input.disabled = true;
+    input.placeholder = 'Pick a site first';
+    return;
+  }
+  let locations = state.data.locations.filter(l => l.siteId === siteId);
+  if (restrictToExisting && itemId) {
+    const locsWithItem = new Set(
+      state.data.placements
+        .filter(p => p.itemId === itemId && p.siteId === siteId)
+        .map(p => p.locationId)
+        .filter(Boolean)
+    );
+    locations = locations.filter(l => locsWithItem.has(l.id));
+  }
+  locations.sort((a, b) => a.name.localeCompare(b.name));
+  if (dl) dl.innerHTML = locations.map(l => `<option value="${escapeHtml(l.name)}"></option>`).join('');
+  input.disabled = locations.length === 0;
+  input.placeholder = locations.length === 0 ? 'No eligible locations' : 'Type location name…';
+  if (input.value && !locations.find(l => l.name.toLowerCase() === input.value.trim().toLowerCase())) {
+    input.value = '';
+  }
+}
+
+function renderActionContextPanel(type) {
+  // Right-rail style summary of current stock, helps the operator pick correctly.
+  return `
+    <div class="notice" style="margin-top:18px;">
+      // <strong>HINT</strong> — Pick the item first, then the site populates with eligible options. ${type === 'add' ? 'Adding to an existing (item, site, location) increments the placement; otherwise a new placement is created.' : type === 'remove' ? 'Removing the entire quantity deletes the placement record.' : type === 'adjust' ? 'Adjustments are absolute — typing 0 zeroes the placement; typing a value overwrites the current quantity.' : 'Moves are atomic — they fail entirely if either side is invalid, so quantities never end up in an inconsistent state.'}
+    </div>`;
+}
+
+function resetActionForm() {
+  const form = document.getElementById('actionForm');
+  if (form) form.reset();
+  // v54 (Item 1): clear datalist inputs back to their initial states.
+  // Locations stay disabled until a site is picked; sites stay disabled
+  // for restrict-mode actions until an item is picked. Calling onActionItemChange
+  // with an empty string drives both back through their normal cascade.
+  if (form) {
+    onActionItemChange('');
+  }
+  const errEl = document.getElementById('actionError');
+  if (errEl) errEl.textContent = '';
+}
+
+async function submitActionForm(e, type) {
+  e.preventDefault();
+  const form = e.target;
+  const errEl = document.getElementById('actionError');
+  errEl.textContent = '';
+
+  const fd = new FormData(form);
+  // v54 (Item 1): the fields are now text inputs (with datalist autocomplete),
+  // so fd.get(...) returns the typed/picked text. Resolve to actual entity
+  // records before validating quantities and committing.
+  const itemText = (fd.get('itemId') || '').toString();
+  const quantity = parseFloat(fd.get('quantity') || '');
+  const notes    = (fd.get('notes') || '').toString().trim();
+
+  const item = resolveItemByText(itemText);
+  if (!item) { errEl.textContent = itemText ? `No item matches "${itemText}"` : 'Pick an item'; return; }
+  if (isNaN(quantity) || quantity < 0) { errEl.textContent = 'Enter a valid non-negative quantity'; return; }
+  if (type !== 'adjust' && quantity === 0) { errEl.textContent = 'Quantity must be greater than zero'; return; }
+
+  try {
+    let result;
+    if (type === 'move') {
+      const fromSiteText = (fd.get('fromSiteId') || '').toString();
+      const fromLocText  = (fd.get('fromLocationId') || '').toString();
+      const toSiteText   = (fd.get('toSiteId') || '').toString();
+      const toLocText    = (fd.get('toLocationId') || '').toString();
+      const fromSite = resolveSiteByText(fromSiteText);
+      const toSite   = resolveSiteByText(toSiteText);
+      if (!fromSite) { errEl.textContent = fromSiteText ? `No site matches "${fromSiteText}"` : 'Pick the FROM site'; return; }
+      if (!toSite)   { errEl.textContent = toSiteText   ? `No site matches "${toSiteText}"`   : 'Pick the TO site'; return; }
+      const fromLoc = resolveLocationByText(fromLocText, fromSite.id);
+      const toLoc   = resolveLocationByText(toLocText,   toSite.id);
+      if (!fromLoc) { errEl.textContent = fromLocText ? `No location matches "${fromLocText}" at ${fromSite.name}` : 'Pick the FROM location'; return; }
+      if (!toLoc)   { errEl.textContent = toLocText   ? `No location matches "${toLocText}" at ${toSite.name}`   : 'Pick the TO location'; return; }
+      if (fromSite.id === toSite.id && fromLoc.id === toLoc.id) { errEl.textContent = 'FROM and TO must differ'; return; }
+      result = await commitMove(item, fromSite.id, fromLoc.id, toSite.id, toLoc.id, quantity, notes);
+    } else {
+      const siteText = (fd.get('siteId') || '').toString();
+      const locText  = (fd.get('locationId') || '').toString();
+      const site = resolveSiteByText(siteText);
+      if (!site) { errEl.textContent = siteText ? `No site matches "${siteText}"` : 'Pick the site'; return; }
+      const loc  = resolveLocationByText(locText, site.id);
+      if (!loc)  { errEl.textContent = locText ? `No location matches "${locText}" at ${site.name}` : 'Pick the location'; return; }
+      if (type === 'add')    result = await commitAdd(item, site.id, loc.id, quantity, notes);
+      if (type === 'remove') result = await commitRemove(item, site.id, loc.id, quantity, notes);
+      if (type === 'adjust') result = await commitAdjust(item, site.id, loc.id, quantity, notes);
+    }
+    toast(`${ACTION_DEFS[type].verb} successful · ${result.summary}`, 'success');
+    resetActionForm();
+    // Re-render so item-picker eligibility (Remove/Adjust/Move) reflects the new state.
+    render();
+  } catch (err) {
+    errEl.textContent = err.message || 'Something went wrong';
+  }
+}
+
+/* ---------- ACTION COMMITS ----------
+   These are the single authoritative path for placement mutation. Each
+   one validates, mutates state.data.placements, persists, and appends a
+   structured entry to state.actionLog (separate from the general audit
+   log so the History view can render rich details). */
+
+function _siteName(id) { const s = state.data.sites.find(x=>x.id===id); return s ? s.name : '?'; }
+function _locName(id)  { const l = state.data.locations.find(x=>x.id===id); return l ? l.name : '?'; }
+function _findPlacement(itemId, siteId, locationId) {
+  return state.data.placements.find(p => p.itemId === itemId && p.siteId === siteId && (p.locationId || null) === (locationId || null));
+}
+function _logActionEntry(entry) {
+  state.actionLog.push({
+    id: uid(),
+    timestamp: Date.now(),
+    userId: state.user ? state.user.email : 'system',
+    userName: state.user ? (state.user.firstName + ' ' + state.user.lastName).trim() : 'system',
+    userTitle: state.user ? state.user.title : '',
+    ...entry
+  });
+}
+
+async function commitAdd(item, siteId, locationId, qty, notes) {
+  const existing = _findPlacement(item.id, siteId, locationId);
+  const before = existing ? Number(existing.quantity) || 0 : 0;
+  const after = before + qty;
+  if (existing) {
+    existing.quantity = after;
+    existing.lastModifiedAt = Date.now();
+    existing.lastModifiedBy = state.user.email;
+  } else {
+    state.data.placements.push({
+      id: uid(),
+      itemId: item.id,
+      siteId, locationId,
+      quantity: qty,
+      createdAt: Date.now(), createdBy: state.user.email,
+      lastModifiedAt: Date.now(), lastModifiedBy: state.user.email
+    });
+  }
+  await saveType('placements');
+  _logActionEntry({
+    type: 'ADD',
+    itemId: item.id, itemNumber: item.itemNumber, itemName: item.name || '',
+    siteId, siteName: _siteName(siteId),
+    locationId, locationName: _locName(locationId),
+    quantity: qty,
+    previousQuantity: before, newQuantity: after,
+    notes
+  });
+  await saveActionLog();
+  logAction('ACTION_ADD', 'placements', `${item.itemNumber} @ ${_siteName(siteId)}/${_locName(locationId)}`, `+${qty} (${before}→${after})${notes ? ' · ' + notes : ''}`);
+  return { summary: `${item.itemNumber}: ${before} → ${after}` };
+}
+
+async function commitRemove(item, siteId, locationId, qty, notes) {
+  const existing = _findPlacement(item.id, siteId, locationId);
+  if (!existing) throw new Error('No stock at that location');
+  const before = Number(existing.quantity) || 0;
+  if (qty > before) throw new Error(`Cannot remove ${qty} — only ${before} on hand`);
+  const after = before - qty;
+  if (after === 0) {
+    // Delete the placement record entirely when stock hits zero.
+    state.data.placements = state.data.placements.filter(p => p.id !== existing.id);
+  } else {
+    existing.quantity = after;
+    existing.lastModifiedAt = Date.now();
+    existing.lastModifiedBy = state.user.email;
+  }
+  await saveType('placements');
+  _logActionEntry({
+    type: 'REMOVE',
+    itemId: item.id, itemNumber: item.itemNumber, itemName: item.name || '',
+    siteId, siteName: _siteName(siteId),
+    locationId, locationName: _locName(locationId),
+    quantity: qty,
+    previousQuantity: before, newQuantity: after,
+    deletedPlacement: after === 0,
+    notes
+  });
+  await saveActionLog();
+  logAction('ACTION_REMOVE', 'placements', `${item.itemNumber} @ ${_siteName(siteId)}/${_locName(locationId)}`, `-${qty} (${before}→${after})${after === 0 ? ' · placement deleted' : ''}${notes ? ' · ' + notes : ''}`);
+  return { summary: `${item.itemNumber}: ${before} → ${after}${after === 0 ? ' · placement removed' : ''}` };
+}
+
+async function commitAdjust(item, siteId, locationId, newQty, notes) {
+  const existing = _findPlacement(item.id, siteId, locationId);
+  const before = existing ? Number(existing.quantity) || 0 : 0;
+  if (existing) {
+    if (newQty === 0) {
+      state.data.placements = state.data.placements.filter(p => p.id !== existing.id);
+    } else {
+      existing.quantity = newQty;
+      existing.lastModifiedAt = Date.now();
+      existing.lastModifiedBy = state.user.email;
+    }
+  } else {
+    if (newQty === 0) throw new Error('No placement exists and new quantity is zero — nothing to do');
+    state.data.placements.push({
+      id: uid(),
+      itemId: item.id,
+      siteId, locationId,
+      quantity: newQty,
+      createdAt: Date.now(), createdBy: state.user.email,
+      lastModifiedAt: Date.now(), lastModifiedBy: state.user.email
+    });
+  }
+  await saveType('placements');
+  _logActionEntry({
+    type: 'ADJUST',
+    itemId: item.id, itemNumber: item.itemNumber, itemName: item.name || '',
+    siteId, siteName: _siteName(siteId),
+    locationId, locationName: _locName(locationId),
+    quantity: newQty,
+    previousQuantity: before, newQuantity: newQty,
+    deletedPlacement: existing && newQty === 0,
+    notes
+  });
+  await saveActionLog();
+  logAction('ACTION_ADJUST', 'placements', `${item.itemNumber} @ ${_siteName(siteId)}/${_locName(locationId)}`, `${before}→${newQty}${notes ? ' · ' + notes : ''}`);
+  return { summary: `${item.itemNumber}: ${before} → ${newQty}` };
+}
+
+async function commitMove(item, fromSiteId, fromLocationId, toSiteId, toLocationId, qty, notes) {
+  // Atomic move — validate everything before mutating either placement.
+  const src = _findPlacement(item.id, fromSiteId, fromLocationId);
+  if (!src) throw new Error('No stock at the source location');
+  const srcBefore = Number(src.quantity) || 0;
+  if (qty > srcBefore) throw new Error(`Cannot move ${qty} — only ${srcBefore} at source`);
+
+  const dst = _findPlacement(item.id, toSiteId, toLocationId);
+  const dstBefore = dst ? Number(dst.quantity) || 0 : 0;
+
+  // Decrement source
+  const srcAfter = srcBefore - qty;
+  if (srcAfter === 0) {
+    state.data.placements = state.data.placements.filter(p => p.id !== src.id);
+  } else {
+    src.quantity = srcAfter;
+    src.lastModifiedAt = Date.now();
+    src.lastModifiedBy = state.user.email;
+  }
+  // Increment destination
+  const dstAfter = dstBefore + qty;
+  if (dst) {
+    dst.quantity = dstAfter;
+    dst.lastModifiedAt = Date.now();
+    dst.lastModifiedBy = state.user.email;
+  } else {
+    state.data.placements.push({
+      id: uid(),
+      itemId: item.id,
+      siteId: toSiteId, locationId: toLocationId,
+      quantity: qty,
+      createdAt: Date.now(), createdBy: state.user.email,
+      lastModifiedAt: Date.now(), lastModifiedBy: state.user.email
+    });
+  }
+  await saveType('placements');
+  _logActionEntry({
+    type: 'MOVE',
+    itemId: item.id, itemNumber: item.itemNumber, itemName: item.name || '',
+    fromSiteId, fromSiteName: _siteName(fromSiteId), fromLocationId, fromLocationName: _locName(fromLocationId),
+    toSiteId,   toSiteName:   _siteName(toSiteId),   toLocationId,   toLocationName:   _locName(toLocationId),
+    quantity: qty,
+    previousFromQuantity: srcBefore, newFromQuantity: srcAfter,
+    previousToQuantity:   dstBefore, newToQuantity:   dstAfter,
+    notes
+  });
+  await saveActionLog();
+  logAction('ACTION_MOVE', 'placements',
+    `${item.itemNumber}: ${_siteName(fromSiteId)}/${_locName(fromLocationId)} → ${_siteName(toSiteId)}/${_locName(toLocationId)}`,
+    `${qty} units${notes ? ' · ' + notes : ''}`);
+  return { summary: `${item.itemNumber}: ${qty} moved · ${_siteName(fromSiteId)} → ${_siteName(toSiteId)}` };
+}
+
+/* ============ ACTION HISTORY ============ */
+function renderActionHistory(root) {
+  const f = state.actionFilters;
+  let rows = [...state.actionLog].reverse();
+  if (f.type) rows = rows.filter(r => r.type === f.type);
+  if (f.item) rows = rows.filter(r => r.itemId === f.item);
+
+  const types = ['ADD','REMOVE','ADJUST','MOVE'];
+  const itemsInLog = [...new Set(state.actionLog.map(a => a.itemId))]
+    .map(id => state.data.items.find(i => i.id === id))
+    .filter(Boolean)
+    .sort((a,b) => a.itemNumber.localeCompare(b.itemNumber));
+
+  root.innerHTML = `
+    <div class="page-head">
+      <div>
+        <div class="page-title">ACTION HISTORY</div>
+        <div class="page-sub">// Every Add, Remove, Adjust, and Move recorded in chronological order · ${state.actionLog.length.toLocaleString()} total · capped at 2,000 most recent</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-body">
+        <div class="filter-bar">
+          <select onchange="state.actionFilters.type=this.value; render();">
+            <option value="">All types</option>
+            ${types.map(t => `<option value="${t}" ${f.type===t?'selected':''}>${t}</option>`).join('')}
+          </select>
+          <select onchange="state.actionFilters.item=this.value; render();">
+            <option value="">All items</option>
+            ${itemsInLog.map(i => `<option value="${i.id}" ${f.item===i.id?'selected':''}>${escapeHtml(i.itemNumber)}${i.name ? ' — ' + escapeHtml(i.name) : ''}</option>`).join('')}
+          </select>
+          ${(f.type || f.item) ? `<button class="btn ghost sm" onclick="state.actionFilters={type:'',item:''}; render();">CLEAR</button>` : ''}
+          <span class="page-sub" style="margin:0;">${rows.length} of ${state.actionLog.length}</span>
+        </div>
+        <div class="table-wrap">
+          ${rows.length === 0 ? `<div class="empty"><div class="empty-icon">∅</div><div class="empty-text">// ${state.actionLog.length === 0 ? 'NO ACTIONS RECORDED YET' : 'NO ACTIONS MATCH THE CURRENT FILTERS'}</div></div>` : `
+            <table>
+              <thead><tr>
+                <th style="width:140px;">When</th>
+                <th style="width:80px;">Type</th>
+                <th>Item</th>
+                <th>Details</th>
+                <th style="width:90px;">Qty</th>
+                <th style="width:140px;">Operator</th>
+                <th>Notes</th>
+              </tr></thead>
+              <tbody>
+                ${rows.map(r => `
+                  <tr>
+                    <td class="mono" style="font-size:11px; color:var(--text-dim); white-space:nowrap;">${fmtDate(r.timestamp)}</td>
+                    <td>${actionTypeBadge(r.type)}</td>
+                    <td><span class="id-tag">${escapeHtml(r.itemNumber || '?')}</span>${r.itemName ? `<div class="muted" style="font-size:11px; margin-top:2px;">${escapeHtml(r.itemName)}</div>` : ''}</td>
+                    <td>${actionDetailCell(r)}</td>
+                    <td class="mono"><strong>${r.quantity != null ? r.quantity : '—'}</strong></td>
+                    <td>
+                      <div style="font-size:12px;">${escapeHtml(r.userName || '—')}</div>
+                      <div class="muted" style="font-size:10px; font-family:'JetBrains Mono',monospace;">${escapeHtml(r.userId || '')}</div>
+                    </td>
+                    <td><span class="muted" style="font-size:12px;">${escapeHtml(r.notes || '')}</span></td>
+                  </tr>`).join('')}
+              </tbody>
+            </table>`}
+        </div>
+      </div>
+    </div>`;
+}
+
+function actionTypeBadge(type) {
+  const colors = { ADD: 'green', REMOVE: 'orange', ADJUST: 'cyan', MOVE: 'amber' };
+  return `<span class="badge ${colors[type] || ''}">${type}</span>`;
+}
+
+function actionDetailCell(r) {
+  if (r.type === 'MOVE') {
+    return `<div style="font-size:12px;">
+      <div><span class="muted">FROM</span> ${escapeHtml(r.fromSiteName || '?')}${r.fromLocationName ? ' · ' + escapeHtml(r.fromLocationName) : ''}</div>
+      <div><span class="muted">TO</span> ${escapeHtml(r.toSiteName || '?')}${r.toLocationName ? ' · ' + escapeHtml(r.toLocationName) : ''}</div>
+    </div>`;
+  }
+  const before = r.previousQuantity != null ? r.previousQuantity : '?';
+  const after  = r.newQuantity      != null ? r.newQuantity      : '?';
+  return `<div style="font-size:12px;">
+    <div>${escapeHtml(r.siteName || '?')}${r.locationName ? ' · ' + escapeHtml(r.locationName) : ''}</div>
+    <div class="muted mono" style="font-size:11px;">${before} → ${after}${r.deletedPlacement ? ' · placement removed' : ''}</div>
+  </div>`;
+}
+
+function exportActionLogCSV() {
+  const headers = ['Timestamp','Type','ItemNumber','ItemName','Site','Location','FromSite','FromLocation','ToSite','ToLocation','Quantity','PreviousQuantity','NewQuantity','Operator','OperatorEmail','Notes'];
+  const lines = [headers.join(',')];
+  state.actionLog.forEach(r => {
+    const cells = [
+      new Date(r.timestamp).toISOString(),
+      r.type || '',
+      r.itemNumber || '',
+      r.itemName || '',
+      r.siteName || '',
+      r.locationName || '',
+      r.fromSiteName || '',
+      r.fromLocationName || '',
+      r.toSiteName || '',
+      r.toLocationName || '',
+      r.quantity != null ? r.quantity : '',
+      r.previousQuantity != null ? r.previousQuantity : (r.previousFromQuantity != null ? r.previousFromQuantity : ''),
+      r.newQuantity != null ? r.newQuantity : (r.newFromQuantity != null ? r.newFromQuantity : ''),
+      r.userName || '',
+      r.userId || '',
+      r.notes || ''
+    ].map(v => `"${String(v).replace(/"/g,'""')}"`);
+    lines.push(cells.join(','));
+  });
+  downloadCSV(lines.join('\n'), 'pay-and-save-action-log.csv');
+  logAction('EXPORT', 'actionLog', null, `Exported ${state.actionLog.length} action log entries`);
+}
+
+/* ============ CODE 39 BARCODES ============
+   Self-contained Code 39 encoder + SVG renderer + barcode sheet view.
+   We use Code 39 (rather than Code 128 or QR) because:
+     · the alphabet is sufficient for typical itemNumbers (uppercase
+       letters, digits, hyphens, spaces — all valid in Code 39),
+     · the encoder is tiny (a 44-entry pattern table + a simple bar
+       walker), so the file stays self-contained with zero CDN deps,
+     · most consumer barcode scanners read Code 39 out of the box.
+   Inputs are uppercased and any characters outside Code 39's alphabet
+   are replaced with '-'; a warning is surfaced in the print sheet
+   when this happens so the user can rename the offending record. */
+
+const CODE39 = {
+  '0':'nnnwwnwnn', '1':'wnnwnnnnw', '2':'nnwwnnnnw', '3':'wnwwnnnnn',
+  '4':'nnnwwnnnw', '5':'wnnwwnnnn', '6':'nnwwwnnnn', '7':'nnnwnnwnw',
+  '8':'wnnwnnwnn', '9':'nnwwnnwnn',
+  'A':'wnnnnwnnw', 'B':'nnwnnwnnw', 'C':'wnwnnwnnn', 'D':'nnnnwwnnw',
+  'E':'wnnnwwnnn', 'F':'nnwnwwnnn', 'G':'nnnnnwwnw', 'H':'wnnnnwwnn',
+  'I':'nnwnnwwnn', 'J':'nnnnwwwnn', 'K':'wnnnnnnww', 'L':'nnwnnnnww',
+  'M':'wnwnnnnwn', 'N':'nnnnwnnww', 'O':'wnnnwnnwn', 'P':'nnwnwnnwn',
+  'Q':'nnnnnnwww', 'R':'wnnnnnwwn', 'S':'nnwnnnwwn', 'T':'nnnnwnwwn',
+  'U':'wwnnnnnnw', 'V':'nwwnnnnnw', 'W':'wwwnnnnnn', 'X':'nwnnwnnnw',
+  'Y':'wwnnwnnnn', 'Z':'nwwnwnnnn',
+  '-':'nwnnnnwnw', '.':'wwnnnnwnn', ' ':'nwwnnnwnn',
+  '$':'nwnwnwnnn', '/':'nwnwnnnwn', '+':'nwnnnwnwn', '%':'nnnwnwnwn',
+  '*':'nwnnwnwnn'  // start/stop sentinel — reserved, never appears in user data
+};
+
+/* Map a raw string to a Code 39-safe payload. Returns the cleaned value
+   and a flag indicating whether anything had to change (so the print
+   sheet can show a one-line warning). Empty string in → empty out. */
+function code39Sanitize(raw) {
+  if (raw == null) return { value: '', altered: false };
+  const up = String(raw).toUpperCase();
+  let altered = false;
+  let out = '';
+  for (const c of up) {
+    if (c === '*') { out += '-'; altered = true; continue; } // reserved
+    if (c in CODE39) { out += c; } else { out += '-'; altered = true; }
+  }
+  return { value: out, altered };
+}
+
+/* Returns an SVG markup string encoding `text` as Code 39. Caller is
+   responsible for sanitizing first; if an unsupported char slips in we
+   silently skip it (the start/stop sentinels still wrap the rest, so
+   the output is technically valid but missing data — sanitize upstream
+   to avoid this).
+     · narrow / wide are the bar/space widths in SVG user units; the
+       standard 3:1 wide:narrow ratio is the most reliably-decoded.
+     · height is the barcode body height; the viewBox lets browsers
+       scale the result to whatever container size we render into. */
+function code39SVG(text, opts) {
+  opts = opts || {};
+  const narrow = opts.narrow || 2;
+  const wide   = opts.wide   || 6;
+  const height = opts.height || 60;
+  const margin = opts.margin || 10;
+  const data = '*' + String(text || '').toUpperCase() + '*';
+
+  let x = margin;
+  let bars = '';
+  for (let i = 0; i < data.length; i++) {
+    const pattern = CODE39[data[i]];
+    if (!pattern) continue;
+    for (let j = 0; j < pattern.length; j++) {
+      const w = pattern[j] === 'w' ? wide : narrow;
+      const isBar = j % 2 === 0; // even index = bar, odd = inter-element space
+      if (isBar) bars += `<rect x="${x}" y="0" width="${w}" height="${height}" fill="#000" />`;
+      x += w;
+    }
+    if (i < data.length - 1) x += narrow; // inter-character narrow space
+  }
+  const totalWidth = x + margin;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${totalWidth} ${height}" preserveAspectRatio="xMidYMid meet" style="display:block;width:100%;height:100%;">${bars}</svg>`;
+}
+
+/* Returns an array of `{ tag, code, line1, line2 }` describing the labels
+   to render for a given subject type. Centralized here so the values that
+   get encoded into the barcode and shown to humans never drift apart.
+     · items     → encode itemNumber (already uppercase/digits in typical
+                   use); show name underneath for the operator
+     · sites     → encode the site name (unique by schema constraint);
+                   show "SITE" tag
+     · locations → encode the location name (NOT globally unique — names
+                   are unique per-site only); show site name + location
+                   name as the human-readable subtext so an operator can
+                   visually disambiguate. A scanner workflow that needs
+                   system-unique location codes would want a different
+                   encoding scheme (id-based or composite); flagged as a
+                   trade-off in the warning area when relevant. */
+function barcodeLabelsFor(type) {
+  if (type === 'items') {
+    return state.data.items.map(i => ({
+      tag: 'ITEM',
+      raw: i.itemNumber || '',
+      line1: i.itemNumber || '—',
+      line2: i.name || ''
+    }));
+  }
+  if (type === 'sites') {
+    return state.data.sites.map(s => ({
+      tag: 'SITE',
+      raw: s.name || '',
+      line1: s.name || '—',
+      line2: ''
+    }));
+  }
+  if (type === 'locations') {
+    return state.data.locations.map(l => {
+      const s = state.data.sites.find(x => x.id === l.siteId);
+      return {
+        tag: 'LOCATION',
+        raw: l.name || '',
+        line1: l.name || '—',
+        line2: s ? s.name : '— missing site —'
+      };
+    });
+  }
+  return [];
+}
+
+/* Open the full-screen barcode sheet for items / sites / locations.
+   Renders into #modalHost so it sits above the rest of the app, then
+   calling window.print() either via the in-sheet Print button or the
+   browser's own Cmd-P will pick up the print stylesheet that hides the
+   sheet chrome and reformats each sticker to a single print page sized
+   to the sticker dimensions. Layout per sticker: top = "name" line (line2
+   when present, otherwise the tag label), middle = Code 39 barcode,
+   bottom = "number" line (line1). Each sticker is 2" wide × 1" tall;
+   one sticker per print page. */
+function openBarcodeSheet(type) {
+  const TITLES = { items: 'ITEM BARCODES', sites: 'SITE BARCODES', locations: 'LOCATION BARCODES' };
+  const subjects = barcodeLabelsFor(type);
+  renderBarcodeStickerSheet({
+    kind: type,
+    title: TITLES[type] || 'BARCODES',
+    subjects,
+    extraWarnings: type === 'locations' && new Set(state.data.locations.map(l => l.siteId)).size > 1
+      ? [`Location names are only unique within a site. These barcodes encode just the location name, so a scanner workflow spanning multiple sites would need additional context (site barcode scanned first, or a different encoding scheme).`]
+      : []
+  });
+}
+
+/* Batch print: same sticker sheet, but built from the live selection on
+   the All Items list. Each sticker shows the item NAME up top, barcode
+   in the middle, and item NUMBER at the bottom — matching the user-
+   specified design. */
+function openBatchPrintBarcodes() {
+  const items = selectedItemsCurrent();
+  if (items.length === 0) { toast('No items selected', 'error'); return; }
+  const subjects = items.map(i => ({
+    tag: 'ITEM',
+    raw: i.itemNumber || '',
+    line1: i.itemNumber || '—',
+    line2: i.name || ''
+  }));
+  renderBarcodeStickerSheet({
+    kind: 'items-batch',
+    title: 'PRINT BARCODES',
+    subjects,
+    headerSub: `${items.length} sticker${items.length === 1 ? '' : 's'} for selected items · Code 39 · one 2"×1" sticker per print page`
+  });
+}
+
+/* Shared rendering: takes prepared subjects, sanitizes each for Code 39,
+   builds the warning banner if needed, and lays out the stickers in a
+   vertical stack. Called by both type-based and batch entry points. */
+function renderBarcodeStickerSheet({ kind, title, subjects, extraWarnings = [], headerSub }) {
+  state.barcodeSheet = { kind, title, subjects };
+
+  if (!subjects || subjects.length === 0) {
+    document.getElementById('modalHost').innerHTML = `
+      <div class="barcode-sheet-overlay">
+        <div class="barcode-sheet-chrome">
+          <div>
+            <div class="barcode-sheet-title">${title}</div>
+            <div class="barcode-sheet-sub">// no records to print</div>
+          </div>
+          <div class="btn-row" style="margin:0;">
+            <button class="btn ghost" onclick="closeBarcodeSheet()">CLOSE</button>
+          </div>
+        </div>
+        <div class="barcode-sheet-body">
+          <div class="empty"><div class="empty-icon">∅</div><div class="empty-text">// NOTHING TO BARCODE</div></div>
+        </div>
+      </div>`;
+    return;
+  }
+
+  // Sanitize each label up-front so the warning banner can summarize.
+  const prepared = subjects.map(s => {
+    const { value, altered } = code39Sanitize(s.raw);
+    return { ...s, encoded: value, altered };
+  });
+  const alteredCount = prepared.filter(p => p.altered).length;
+  const warnings = [];
+  if (alteredCount > 0) {
+    warnings.push(`<strong>${alteredCount}</strong> ${alteredCount === 1 ? 'label has' : 'labels have'} characters outside Code 39's alphabet — those characters were replaced with '<code>-</code>' in the barcode. The human-readable text below each barcode is unchanged.`);
+  }
+  warnings.push(...extraWarnings);
+
+  // Decide what to show as TOP and BOTTOM bands on each sticker. For items
+  // we want name-on-top, number-on-bottom — line2 holds the name, line1
+  // holds the item number. For sites and locations there's no separate
+  // name/number distinction; fall back to the tag for the top band.
+  const topFor = p => p.line2 && p.line2.trim() ? p.line2 : p.tag;
+  const bottomFor = p => p.line1;
+
+  document.getElementById('modalHost').innerHTML = `
+    <div class="barcode-sheet-overlay">
+      <div class="barcode-sheet-chrome">
+        <div>
+          <div class="barcode-sheet-title">${title}</div>
+          <div class="barcode-sheet-sub">// ${headerSub || `${prepared.length} sticker${prepared.length === 1 ? '' : 's'} · Code 39 · 2"×1" · one per print page`}</div>
+        </div>
+        <div class="btn-row" style="margin:0;">
+          <button class="btn" onclick="window.print()">↳ PRINT</button>
+          <button class="btn ghost" onclick="closeBarcodeSheet()">CLOSE</button>
+        </div>
+      </div>
+      <div class="barcode-sheet-body">
+        ${warnings.length ? warnings.map(w => `<div class="barcode-warn">// ${w}</div>`).join('') : ''}
+        <div class="barcode-stack-hint">// Preview at actual print size · use your browser's Print dialog if you need to change page size, scale, or margins.</div>
+        <div class="barcode-stack">
+          ${prepared.map(p => `
+            <div class="barcode-sticker">
+              <div class="barcode-sticker-name" title="${escapeHtml(topFor(p))}">${escapeHtml(topFor(p))}</div>
+              <div class="barcode-sticker-svg">${code39SVG(p.encoded, { height: 50 })}</div>
+              <div class="barcode-sticker-num" title="${escapeHtml(bottomFor(p))}">${escapeHtml(bottomFor(p))}</div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    </div>`;
+}
+
+function closeBarcodeSheet() {
+  state.barcodeSheet = null;
+  document.getElementById('modalHost').innerHTML = '';
+}
+
+/* ============================================================
+   BATCH ACTIONS (Add / Remove / Move)
+   Triggered from the All Items list selection bar. Each batch
+   action opens a modal that picks one (site, location) pair
+   (or two, for Move) and accepts a per-item quantity. Submit
+   loops over the selected items and calls the single-item
+   commitAdd / commitRemove / commitMove helpers — same code
+   path as the per-item Actions tab, so audit / action-log /
+   placement-mutation semantics are identical.
+   ============================================================ */
+const BATCH_DEFS = {
+  add: {
+    title: 'BATCH ADD STOCK',
+    sub: 'Add the same site/location to every selected item, with a per-item quantity',
+    verb: 'ADD',
+    requireSourcePlacement: false
+  },
+  remove: {
+    title: 'BATCH REMOVE STOCK',
+    sub: 'Remove stock from one (site, location) across every selected item',
+    verb: 'REMOVE',
+    requireSourcePlacement: true
+  },
+  move: {
+    title: 'BATCH MOVE STOCK',
+    sub: 'Move stock from one (site, location) to another across every selected item',
+    verb: 'MOVE',
+    requireSourcePlacement: true
+  }
+};
+
+function openBatchAction(kind) {
+  if (!BATCH_DEFS[kind]) return;
+  const items = selectedItemsCurrent();
+  if (items.length === 0) { toast('No items selected', 'error'); return; }
+  if (state.data.sites.length === 0 || state.data.locations.length === 0) {
+    toast('Define at least one site and one location first (Lookups → Sites / Locations)', 'error');
+    return;
+  }
+  state.activeBatchAction = kind;
+  state.batchActionForm = {
+    siteId: '', locationId: '',
+    fromSiteId: '', fromLocationId: '',
+    toSiteId: '', toLocationId: '',
+    notes: '',
+    qtyByItem: {} // string keyed by item.id, kept as raw string so the input value round-trips cleanly
+  };
+  renderBatchActionModal();
+}
+
+function closeBatchAction() {
+  state.activeBatchAction = null;
+  state.batchActionForm = null;
+  document.getElementById('modalHost').innerHTML = '';
+}
+
+/* ---------- BARCODE SCANNER (v54, Item 2) ----------
+   Mobile-only camera-driven barcode reader.
+
+   Library: @zxing/library 0.21.3 (UMD bundle from jsDelivr). Lazy-loaded
+   on first scan attempt so the ~300 KB JS isn't paid on the cold-start
+   path — only users who actually scan pay the network cost, and even
+   then only once per page-load (cached thereafter via browser HTTP cache).
+
+   Camera: navigator.mediaDevices.getUserMedia({ video: { facingMode:
+   'environment' } }) — back camera on phones with multiple cameras. On
+   desktops or devices with only one camera, the constraint falls back
+   silently to whatever's available.
+
+   Formats: BrowserMultiFormatReader's default config tries all formats
+   ZXing supports — Code 39, Code 128, EAN, UPC, QR, Data Matrix, PDF417,
+   etc. This covers the labels produced by the in-app PRINT BARCODES
+   feature and any standard product barcodes a user might point at.
+
+   HTTPS: getUserMedia is gated to HTTPS contexts (or localhost). The
+   app is hosted on GitHub Pages which qualifies; running locally over
+   file:// or http:// will fail with a clear toast. */
+
+/* v61 (Request 2): search-input scan floater.
+   When a search input is focused on mobile, a fixed button labeled
+   "📷 SCAN BARCODE" appears at the bottom of the visual viewport —
+   which on iOS / Android sits right above the on-screen keyboard.
+   Tapping it opens the camera scanner; on a successful scan the
+   scanner closes and the input is populated (existing openBarcodeScanner
+   handles that). The floater also stays positioned correctly as the
+   keyboard shows/hides via the visualViewport API.
+
+   Why a floater instead of an inline button? The user explicitly wanted
+   the scan affordance "at the top of the keyboard" — web apps can't
+   inject items into the system keyboard accessory bar, but a fixed-
+   bottom element pinned to the visualViewport gets us functionally the
+   same place. Hardware barcode scanners that type into the input keep
+   working as before (the floater is purely additive). */
+
+/* v69: the floater now attaches to ANY text-like input — not just search
+   inputs. Two state slots:
+     · targetInput  — DOM element to populate on scan success (preferred)
+     · targetType   — legacy search-type string for back-compat with any
+                      caller that pre-dates the generic path
+   The floater click prefers targetInput if set; otherwise falls back to
+   targetType. Global focusin/focusout listeners (registered at boot)
+   set targetInput whenever a text-like input takes focus on mobile or
+   simple view mode. */
+
+let _scanState = { targetInput: null, targetType: null };
+// Legacy alias for code that read the previous global directly.
+let _searchScanState = _scanState;
+
+/* Is this element something we should attach the scan floater to?
+   Yes for: <textarea>, and <input> with type in
+   { text, search, tel, email, url, number }.
+   No for: password, checkbox, radio, file, hidden, submit, button, etc.
+   No for: disabled or readonly fields (user can't change them anyway). */
+function isTextLikeInputForScan(el) {
+  if (!el || !el.tagName) return false;
+  if (el.disabled || el.readOnly) return false;
+  if (el.tagName === 'TEXTAREA') return true;
+  if (el.tagName !== 'INPUT') return false;
+  const t = (el.type || 'text').toLowerCase();
+  return ['text', 'search', 'tel', 'email', 'url', 'number'].includes(t);
+}
+
+/* Global focusin: capture focus on every text-like input. When fired
+   in mobile or simple view mode, set the target and show the floater.
+   Skips desktop (web mode) where the keyboard accessory affordance
+   doesn't apply — desktop users have a physical keyboard. */
+function handleGlobalScanFocusIn(e) {
+  if (state.viewMode !== 'mobile' && state.viewMode !== 'simple') return;
+  const el = e.target;
+  if (!isTextLikeInputForScan(el)) return;
+  _scanState.targetInput = el;
+  _scanState.targetType  = null; // generic path
+  showSearchScanFloater();
+  // Bind visualViewport listeners once so the floater repositions as
+  // the keyboard shows/hides/scrolls. Idempotent (no-op if already bound).
+  if (window.visualViewport && !window.visualViewport._pnsScanBound) {
+    window.visualViewport._pnsScanBound = true;
+    window.visualViewport.addEventListener('resize', positionSearchScanFloater);
+    window.visualViewport.addEventListener('scroll', positionSearchScanFloater);
+  }
+}
+
+/* Global focusout: if no text-like input still has focus after a short
+   delay, drop the floater. The delay matters because clicking the
+   floater's button briefly transitions focus through it; we don't want
+   the floater to vanish before its own click handler runs. */
+function handleGlobalScanFocusOut(e) {
+  setTimeout(() => {
+    const ae = document.activeElement;
+    if (isTextLikeInputForScan(ae)) {
+      // Still on another text-like input — keep floater up, update target.
+      _scanState.targetInput = ae;
+      _scanState.targetType  = null;
+      return;
+    }
+    _scanState.targetInput = null;
+    _scanState.targetType  = null;
+    hideSearchScanFloater();
+  }, 150);
+}
+
+/* Back-compat shims — the existing search inputs have inline
+   onfocus="onSearchInputFocus('items')" / onblur="onSearchInputBlur()"
+   attributes. The global focusin/focusout listeners cover the same
+   ground now, so these functions are essentially no-ops. They remain
+   so the HTML doesn't have to change in every renderer that produces
+   a search field. */
+function onSearchInputFocus(/* type */) { /* handled by global focusin */ }
+function onSearchInputBlur()            { /* handled by global focusout */ }
+
+function ensureSearchScanFloater() {
+  let el = document.getElementById('searchScanFloater');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'searchScanFloater';
+  el.className = 'search-scan-floater';
+  el.innerHTML = `
+    <button type="button"
+            onpointerdown="event.preventDefault()"
+            onclick="onSearchScanFloaterClick()">
+      📷 SCAN BARCODE
+    </button>`;
+  document.body.appendChild(el);
+  return el;
+}
+
+function showSearchScanFloater() {
+  const el = ensureSearchScanFloater();
+  el.classList.add('is-visible');
+  positionSearchScanFloater();
+}
+
+function hideSearchScanFloater() {
+  const el = document.getElementById('searchScanFloater');
+  if (!el) return;
+  el.classList.remove('is-visible');
+  // Clear inline bottom so the next show doesn't briefly flash at a stale
+  // keyboard offset.
+  el.style.bottom = '';
+}
+
+function positionSearchScanFloater() {
+  const el = document.getElementById('searchScanFloater');
+  if (!el || !el.classList.contains('is-visible')) return;
+  if (window.visualViewport) {
+    // The visualViewport shrinks when the keyboard is up. The layout
+    // viewport (where `position: fixed` is anchored) stays full-height,
+    // so we offset the floater up by the keyboard's height.
+    const vv = window.visualViewport;
+    const offsetFromBottom = Math.max(0, window.innerHeight - (vv.height + vv.offsetTop));
+    el.style.bottom = offsetFromBottom + 'px';
+  } else {
+    el.style.bottom = '0';
+  }
+}
+
+function onSearchScanFloaterClick() {
+  // v69: prefer the generic input target if set; fall back to the
+  // legacy search-type route.
+  if (_scanState.targetInput) {
+    const el = _scanState.targetInput;
+    hideSearchScanFloater();
+    openBarcodeScanner(el);
+    return;
+  }
+  if (_scanState.targetType) {
+    const t = _scanState.targetType;
+    hideSearchScanFloater();
+    openBarcodeScanner(t);
+  }
+}
+
+
+/* (continued from BARCODE SCANNER header above)
+   Permissions: first scan triggers the browser camera permission prompt.
+   Denial → toast + scanner closes. iOS Safari may re-prompt on each
+   visit (no permanent grant for non-installed PWAs); Chrome remembers
+   per-origin. */
+
+let _zxingLoadPromise = null;
+function _loadZXing() {
+  if (typeof window !== 'undefined' && window.ZXing) return Promise.resolve(window.ZXing);
+  if (_zxingLoadPromise) return _zxingLoadPromise;
+  _zxingLoadPromise = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    // Pinned to a specific version rather than @latest so cache busts are
+    // explicit and the build can't surprise us with a major bump.
+    s.src = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
+    s.async = true;
+    s.onload = () => {
+      if (window.ZXing) resolve(window.ZXing);
+      else reject(new Error('Library loaded but ZXing global missing'));
+    };
+    s.onerror = () => {
+      _zxingLoadPromise = null; // Allow retry on transient network failures.
+      reject(new Error('Failed to load barcode scanner library'));
+    };
+    document.head.appendChild(s);
+  });
+  return _zxingLoadPromise;
+}
+
+async function openBarcodeScanner(target) {
+  // v69: target can now be either:
+  //   · a STRING targetType (legacy): drives a search-input + refreshListTable
+  //     update via the search-by-type code path
+  //   · an HTMLElement (new): the input/textarea to populate on scan success
+  // Both routes funnel through handleBarcodeScanResult which branches on
+  // the type. The modal subtitle adjusts to the kind of target.
+  const isElTarget = target instanceof HTMLElement;
+  const targetType = isElTarget ? null : target;
+  const subtitle = isElTarget
+    ? '// Populates the focused field with the decoded value'
+    : '// Searches the ' + escapeHtml(targetType) + ' list with the decoded value';
+  // Render an "initializing" modal immediately so the user sees feedback
+  // while the library loads (potentially a second or two on first scan).
+  document.getElementById('modalHost').innerHTML = `
+    <div class="modal-overlay" onclick="if(event.target===this) closeBarcodeScanner()">
+      <div class="modal">
+        <div class="modal-head">
+          <div class="modal-title-row">
+            <div class="modal-title">Scan Barcode</div>
+            <div class="modal-sub">${subtitle}</div>
+          </div>
+          <button class="close-btn" onclick="closeBarcodeScanner()" aria-label="Close">×</button>
+        </div>
+        <div class="modal-body">
+          <!-- v71: video wrapper hosts both the camera feed and a centered
+               viewfinder rectangle to guide users on where to point the
+               phone. The viewfinder is purely decorative — ZXing decodes
+               the whole frame — but it helps users frame small labels. -->
+          <div class="barcode-scanner-stage">
+            <video id="barcodeVideo" class="barcode-scanner-video" playsinline muted autoplay></video>
+            <div class="barcode-viewfinder" aria-hidden="true">
+              <span class="bvf-corner bvf-tl"></span>
+              <span class="bvf-corner bvf-tr"></span>
+              <span class="bvf-corner bvf-bl"></span>
+              <span class="bvf-corner bvf-br"></span>
+            </div>
+          </div>
+          <div id="barcodeStatus" class="barcode-scanner-status">// Loading scanner library…</div>
+        </div>
+        <div class="modal-foot">
+          <div>
+            <!-- v71: torch toggle. Hidden until capabilities check confirms
+                 the device supports it (handled in tryEnableTorchSupport
+                 below). On modern iPhones / Androids this lets users
+                 light a dark label without leaving the modal. -->
+            <button id="barcodeTorchBtn" class="btn ghost" type="button" style="display:none;" onclick="toggleBarcodeTorch()">⚡ TORCH</button>
+          </div>
+          <div class="modal-foot-buttons">
+            <button class="btn ghost" type="button" onclick="closeBarcodeScanner()">CANCEL</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  let ZXing;
+  try {
+    ZXing = await _loadZXing();
+  } catch (err) {
+    const statusEl = document.getElementById('barcodeStatus');
+    if (statusEl) {
+      statusEl.textContent = '// ' + (err.message || 'Could not load scanner');
+      statusEl.classList.add('barcode-scanner-error');
+    }
+    return;
+  }
+
+  // Stash for cleanup. If the user already had a scanner open and reopened
+  // (shouldn't happen given the modal flow, but defensive), reset the old one.
+  if (state._barcodeReader) {
+    try { state._barcodeReader.reset(); } catch (e) {}
+    state._barcodeReader = null;
+  }
+
+  // v70: speed up decode by restricting to common formats. ZXing's default
+  // multi-format reader tries every supported format on every frame; that's
+  // accurate but slow on mobile CPUs. The hint map below limits it to the
+  // formats real inventory labels use:
+  //   1D : Code 128, Code 39, EAN-13, EAN-8, UPC-A, UPC-E, ITF
+  //   2D : QR, Data Matrix
+  // TRY_HARDER tells the library to spend more decoder effort per frame —
+  // counterintuitively this is faster overall because the limited format
+  // set is cheap to try harder against, and successful decodes happen on
+  // earlier frames. If you ever need PDF417 / Aztec / Codabar support, add
+  // them to the array.
+  let reader;
+  try {
+    const hints = new Map();
+    if (ZXing.DecodeHintType && ZXing.BarcodeFormat) {
+      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+        ZXing.BarcodeFormat.QR_CODE,
+        ZXing.BarcodeFormat.CODE_128,
+        ZXing.BarcodeFormat.CODE_39,
+        ZXing.BarcodeFormat.EAN_13,
+        ZXing.BarcodeFormat.EAN_8,
+        ZXing.BarcodeFormat.UPC_A,
+        ZXing.BarcodeFormat.UPC_E,
+        ZXing.BarcodeFormat.ITF,
+        ZXing.BarcodeFormat.DATA_MATRIX
+      ]);
+      hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    }
+    reader = new ZXing.BrowserMultiFormatReader(hints);
+  } catch (e) {
+    // Fallback: vanilla constructor if the hint API isn't where we expect
+    // (e.g. major ZXing release bumped). Decode works, just slower.
+    reader = new ZXing.BrowserMultiFormatReader();
+  }
+  state._barcodeReader = reader;
+  state._barcodeReader = reader;
+  // v69: stash the resolved target (either string or element) for the
+  // result handler. Renamed from _barcodeTargetType since the type is now
+  // polymorphic.
+  state._barcodeTarget = target;
+
+  const videoEl = document.getElementById('barcodeVideo');
+  const statusEl = document.getElementById('barcodeStatus');
+  if (statusEl) statusEl.textContent = '// Requesting camera…';
+
+  try {
+    // v71: bumped from 720p to 1080p because real-world scans of small
+    // thermal labels (Code 128 SKUs ~1.5" wide, scanned from ~10" away)
+    // were leaving ~150px across the barcode — borderline for the Code
+    // 128 bar pattern. 1080p gives ~200-300px which decodes reliably.
+    // Slower per-frame than 720p, but overall scan time drops because
+    // successful decodes happen sooner. The browser falls back to the
+    // camera's max if 1080p isn't supported.
+    await reader.decodeFromConstraints(
+      { video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false },
+      videoEl,
+      (result, err) => {
+        if (result) {
+          const text = result.getText();
+          handleBarcodeScanResult(text, state._barcodeTarget);
+        }
+        // ZXing fires `err` on every frame that doesn't decode — that's
+        // normal, not an error. We ignore it. Real errors (camera lost,
+        // device removed) come through as exceptions on the outer promise.
+      }
+    );
+    if (statusEl) statusEl.textContent = '// Point camera at a barcode…';
+    // v71: probe the camera track for torch support and reveal the toggle
+    // button if available. Wrapped in try/catch — older browsers throw
+    // on getCapabilities or applyConstraints with non-standard keys.
+    tryEnableTorchSupport(videoEl);
+    // v71: adaptive hint — if no decode has happened after 5 seconds,
+    // update the status to suggest moving closer or improving lighting.
+    // Cleared automatically when the modal closes.
+    state._barcodeHintTimer = setTimeout(() => {
+      const s = document.getElementById('barcodeStatus');
+      if (s) s.textContent = '// Hold steady · try moving closer · use TORCH for low light';
+    }, 5000);
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = '// ' + ((err && err.message) || 'Camera unavailable');
+      statusEl.classList.add('barcode-scanner-error');
+    }
+    // Common cases: NotAllowedError (permission denied), NotFoundError
+    // (no camera), NotReadableError (camera in use by another app).
+    // We don't differentiate in the UI beyond the raw message — the
+    // browser's wording is usually clear enough.
+  }
+}
+
+/* v71: probe the active camera track for torch capability. If supported,
+   reveal the TORCH button in the scanner modal foot. iOS Safari and most
+   modern Android Chromes expose torch on the back camera; older browsers
+   throw on getCapabilities — caught and treated as "no torch". */
+function tryEnableTorchSupport(videoEl) {
+  try {
+    const stream = videoEl && videoEl.srcObject;
+    if (!stream) return;
+    const track = stream.getVideoTracks ? stream.getVideoTracks()[0] : null;
+    if (!track || !track.getCapabilities) return;
+    const caps = track.getCapabilities();
+    if (caps && caps.torch) {
+      state._barcodeTorchTrack = track;
+      state._barcodeTorchOn = false;
+      const btn = document.getElementById('barcodeTorchBtn');
+      if (btn) btn.style.display = '';
+    }
+  } catch (e) { /* unsupported — leave button hidden */ }
+}
+
+/* Toggle the torch on/off via applyConstraints. The button's class also
+   flips so the active state is obvious. */
+async function toggleBarcodeTorch() {
+  const track = state._barcodeTorchTrack;
+  if (!track || !track.applyConstraints) return;
+  const wantOn = !state._barcodeTorchOn;
+  try {
+    await track.applyConstraints({ advanced: [{ torch: wantOn }] });
+    state._barcodeTorchOn = wantOn;
+    const btn = document.getElementById('barcodeTorchBtn');
+    if (btn) btn.classList.toggle('is-on', wantOn);
+  } catch (e) {
+    // Older WebKit sometimes rejects torch toggles silently — surface to user.
+    toast('Torch not available on this device', 'error');
+  }
+}
+
+function handleBarcodeScanResult(text, target) {
+  // v69: branch on target type.
+  //  · STRING (legacy search-input route): update state.search, paint the
+  //    visible search inputs, kick refreshListTable to re-render the
+  //    matching list page.
+  //  · HTMLElement (any text input): set .value, dispatch input + change
+  //    events so any oninput/onchange handler (state.formData updates,
+  //    item search re-renders, action form site-datalist population, etc.)
+  //    fires naturally, then re-focus the input.
+  if (typeof target === 'string') {
+    state.search[target] = text;
+    const inputs = document.querySelectorAll('.filter-bar .search.mono-input');
+    inputs.forEach(inp => { inp.value = text; });
+    if (typeof refreshListTable === 'function') {
+      try { refreshListTable(target); } catch (e) { /* non-fatal */ }
+    }
+    toast(`Scanned: ${text}`, 'success');
+  } else if (target instanceof HTMLElement) {
+    // v70: if the input is bound to a datalist (action item picker, site
+    // picker, etc.), try to normalize the scanned text to the canonical
+    // option value. Scanning "PEN-001" on an actionItemsList-bound input
+    // should produce "PEN-001 — Pencil" so resolveItemByText finds the
+    // match on submit and onActionItemChange populates the site datalist.
+    const normalized = normalizeScannedToDatalist(text, target);
+    target.value = normalized;
+    // Dispatching 'input' triggers any registered oninput handler
+    // (Simple ITEM SEARCH's live filter, form-field's state.formData
+    // tracker, etc.). 'change' triggers handlers like the action form's
+    // onActionItemChange that populate downstream pickers.
+    try { target.dispatchEvent(new Event('input',  { bubbles: true })); } catch (e) {}
+    try { target.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+    // Re-focus the input after the modal closes. Wrapped in setTimeout
+    // so the focus call happens after the modal is fully removed —
+    // otherwise the modal's own focus handling can win.
+    setTimeout(() => { try { target.focus(); } catch (e) {} }, 50);
+    if (normalized !== text) {
+      toast(`Found: ${normalized}`, 'success');
+    } else {
+      toast(`Scanned: ${text}`, 'success');
+    }
+  }
+  closeBarcodeScanner();
+}
+
+/* v70: walk the input's linked <datalist> looking for an option whose
+   value matches the scanned text. Match strategy (in priority order):
+     1. Exact case-insensitive value match            ("PEN-001" → "PEN-001")
+     2. "<scanned> — …" prefix match (canonical form) ("PEN-001" → "PEN-001 — Pencil")
+     3. Value's leading token (up to first " — ") equals scanned text
+     4. No match → return raw scanned text unchanged
+   Strategy 3 catches scans where the labeled form uses a different
+   separator/format than 2. Conservative — never rewrites unless an
+   option is an unambiguous match. */
+function normalizeScannedToDatalist(text, inputEl) {
+  if (!inputEl || !text) return text;
+  const listId = inputEl.getAttribute('list');
+  if (!listId) return text;
+  const dl = document.getElementById(listId);
+  if (!dl) return text;
+  const t = String(text).trim();
+  const tLower = t.toLowerCase();
+  const options = Array.from(dl.querySelectorAll('option'));
+  // 1: exact value match
+  for (const opt of options) {
+    if (opt.value.toLowerCase() === tLower) return opt.value;
+  }
+  // 2: "<scanned> — …" prefix match (canonical "ITEM-NUM — Name" form)
+  for (const opt of options) {
+    if (opt.value.toLowerCase().startsWith(tLower + ' — ')) return opt.value;
+  }
+  // 3: leading token (before " — ") equals scanned text
+  for (const opt of options) {
+    const head = opt.value.split(' — ')[0];
+    if (head && head.toLowerCase() === tLower) return opt.value;
+  }
+  return text;
+}
+
+function closeBarcodeScanner() {
+  if (state._barcodeReader) {
+    try { state._barcodeReader.reset(); } catch (e) {}
+    state._barcodeReader = null;
+  }
+  // v71: clear the adaptive-hint timer if it was still pending.
+  if (state._barcodeHintTimer) {
+    try { clearTimeout(state._barcodeHintTimer); } catch (e) {}
+    state._barcodeHintTimer = null;
+  }
+  // Belt-and-suspenders: explicitly stop any media tracks attached to
+  // the video element. ZXing's reset() does this internally, but if the
+  // library ever changes behavior or fails partway through, the user's
+  // camera light staying on is a privacy concern worth defending against.
+  const v = document.getElementById('barcodeVideo');
+  if (v && v.srcObject) {
+    try { v.srcObject.getTracks().forEach(t => t.stop()); } catch (e) {}
+    v.srcObject = null;
+  }
+  // v71: clear torch references — the track is gone after the stream
+  // closes, but keeping the ref would leak memory across scans.
+  state._barcodeTorchTrack = null;
+  state._barcodeTorchOn = false;
+  state._barcodeTarget = null;
+  state._barcodeTargetType = null;
+  const host = document.getElementById('modalHost');
+  if (host) host.innerHTML = '';
+}
+
+/* Picker helpers: returns the eligible sites for a given batch context.
+   For Add, any site is eligible. For Remove/Move-from, restrict to sites
+   that have at least one placement for at least one selected item — so
+   the user doesn't pick a site where none of the selection lives. */
+function batchEligibleSites(kind, role) {
+  if (kind === 'add' || (kind === 'move' && role === 'to')) {
+    return [...state.data.sites].sort((a,b) => a.name.localeCompare(b.name));
+  }
+  // Source side of Remove / Move: sites that hold ANY selected item.
+  const selectedIds = new Set([...state.selectedItemIds]);
+  const eligibleSiteIds = new Set();
+  state.data.placements.forEach(p => {
+    if (selectedIds.has(p.itemId)) eligibleSiteIds.add(p.siteId);
+  });
+  return state.data.sites.filter(s => eligibleSiteIds.has(s.id)).sort((a,b) => a.name.localeCompare(b.name));
+}
+function batchEligibleLocations(kind, role, siteId) {
+  if (!siteId) return [];
+  const allAtSite = state.data.locations.filter(l => l.siteId === siteId).sort((a,b) => a.name.localeCompare(b.name));
+  if (kind === 'add' || (kind === 'move' && role === 'to')) return allAtSite;
+  // Source side: locations that hold ANY selected item at this site.
+  const selectedIds = new Set([...state.selectedItemIds]);
+  const eligibleLocIds = new Set();
+  state.data.placements.forEach(p => {
+    if (selectedIds.has(p.itemId) && p.siteId === siteId && p.locationId) eligibleLocIds.add(p.locationId);
+  });
+  return allAtSite.filter(l => eligibleLocIds.has(l.id));
+}
+
+/* For each selected item, look up how much stock exists at the chosen
+   source (site, location). Used by Remove and Move to show the operator
+   what's available and to gray-out items that can't participate. */
+function batchAvailableAt(itemId, siteId, locationId) {
+  if (!siteId || !locationId) return null;
+  const p = state.data.placements.find(p => p.itemId === itemId && p.siteId === siteId && p.locationId === locationId);
+  return p ? Number(p.quantity) || 0 : 0;
+}
+
+function renderBatchActionModal() {
+  const kind = state.activeBatchAction;
+  const def = BATCH_DEFS[kind];
+  const form = state.batchActionForm;
+  const items = selectedItemsCurrent();
+  const isMove = kind === 'move';
+
+  const sites = batchEligibleSites(kind, isMove ? 'from' : null);
+  const sitesTo = isMove ? batchEligibleSites(kind, 'to') : [];
+
+  const locs = batchEligibleLocations(kind, isMove ? 'from' : null, isMove ? form.fromSiteId : form.siteId);
+  const locsTo = isMove ? batchEligibleLocations(kind, 'to', form.toSiteId) : [];
+
+  // Source-side context (Remove / Move-from): for each item, how many
+  // are available at the chosen source. Used to render the per-row
+  // availability hint and to gray-out items with zero stock there.
+  const sourceSiteId = isMove ? form.fromSiteId : form.siteId;
+  const sourceLocId  = isMove ? form.fromLocationId : form.locationId;
+  const sourceLocked = def.requireSourcePlacement && sourceSiteId && sourceLocId;
+
+  document.getElementById('modalHost').innerHTML = `
+    <div class="modal-overlay" onclick="if(event.target===this) closeBatchAction()">
+      <div class="modal lg">
+        <div class="modal-head">
+          <div class="modal-title-row">
+            <div class="modal-title">${def.title}</div>
+            <div class="modal-sub">// ${def.sub}</div>
+          </div>
+          <button class="close-btn" onclick="closeBatchAction()" aria-label="Close">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="batch-modal-summary">// ${items.length} item${items.length === 1 ? '' : 's'} in scope · Operator: ${escapeHtml(state.user.firstName + ' ' + state.user.lastName)}</div>
+          <form id="batchActionForm" onsubmit="submitBatchAction(event)">
+            ${isMove ? `
+              <div class="form-grid">
+                <div class="field"><div class="field-label-row"><label>FROM Site</label><span class="req-badge">REQUIRED</span></div>
+                  <!-- v54 (Item 1): text + datalist replaces select. State
+                       still stores siteId/locationId; the input shows the
+                       NAME. onBatchSiteChange resolves typed text → site
+                       (or empty if no match yet) and re-renders the modal,
+                       which cascades the location list. -->
+                  <input type="text" name="fromSiteId" list="batchFromSiteList" autocomplete="off"
+                         value="${escapeHtml(siteNameById(form.fromSiteId))}"
+                         placeholder="${sites.length ? 'Type site name…' : 'No sites with selected items'}"
+                         ${sites.length ? '' : 'disabled'}
+                         onchange="onBatchSiteChange('from', this.value)">
+                  <datalist id="batchFromSiteList">${sites.map(s => `<option value="${escapeHtml(s.name)}"></option>`).join('')}</datalist>
+                </div>
+                <div class="field"><div class="field-label-row"><label>FROM Location</label><span class="req-badge">REQUIRED</span></div>
+                  <input type="text" name="fromLocationId" list="batchFromLocationList" autocomplete="off"
+                         value="${escapeHtml(locationNameById(form.fromLocationId))}"
+                         placeholder="${form.fromSiteId ? (locs.length ? 'Type location name…' : 'No eligible locations') : 'Pick a site first'}"
+                         ${form.fromSiteId && locs.length ? '' : 'disabled'}
+                         onchange="onBatchLocationChange('from', this.value)">
+                  <datalist id="batchFromLocationList">${locs.map(l => `<option value="${escapeHtml(l.name)}"></option>`).join('')}</datalist>
+                </div>
+                <div class="field"><div class="field-label-row"><label>TO Site</label><span class="req-badge">REQUIRED</span></div>
+                  <input type="text" name="toSiteId" list="batchToSiteList" autocomplete="off"
+                         value="${escapeHtml(siteNameById(form.toSiteId))}"
+                         placeholder="Type site name…"
+                         onchange="onBatchSiteChange('to', this.value)">
+                  <datalist id="batchToSiteList">${sitesTo.map(s => `<option value="${escapeHtml(s.name)}"></option>`).join('')}</datalist>
+                </div>
+                <div class="field"><div class="field-label-row"><label>TO Location</label><span class="req-badge">REQUIRED</span></div>
+                  <input type="text" name="toLocationId" list="batchToLocationList" autocomplete="off"
+                         value="${escapeHtml(locationNameById(form.toLocationId))}"
+                         placeholder="${form.toSiteId ? 'Type location name…' : 'Pick a site first'}"
+                         ${form.toSiteId ? '' : 'disabled'}
+                         onchange="onBatchLocationChange('to', this.value)">
+                  <datalist id="batchToLocationList">${locsTo.map(l => `<option value="${escapeHtml(l.name)}"></option>`).join('')}</datalist>
+                </div>
+              </div>
+            ` : `
+              <div class="form-grid">
+                <div class="field"><div class="field-label-row"><label>Site</label><span class="req-badge">REQUIRED</span></div>
+                  <input type="text" name="siteId" list="batchSiteList" autocomplete="off"
+                         value="${escapeHtml(siteNameById(form.siteId))}"
+                         placeholder="${sites.length ? 'Type site name…' : 'No eligible sites'}"
+                         ${sites.length ? '' : 'disabled'}
+                         onchange="onBatchSiteChange('', this.value)">
+                  <datalist id="batchSiteList">${sites.map(s => `<option value="${escapeHtml(s.name)}"></option>`).join('')}</datalist>
+                </div>
+                <div class="field"><div class="field-label-row"><label>Location</label><span class="req-badge">REQUIRED</span></div>
+                  <input type="text" name="locationId" list="batchLocationList" autocomplete="off"
+                         value="${escapeHtml(locationNameById(form.locationId))}"
+                         placeholder="${form.siteId ? (locs.length ? 'Type location name…' : 'No eligible locations') : 'Pick a site first'}"
+                         ${form.siteId && locs.length ? '' : 'disabled'}
+                         onchange="onBatchLocationChange('', this.value)">
+                  <datalist id="batchLocationList">${locs.map(l => `<option value="${escapeHtml(l.name)}"></option>`).join('')}</datalist>
+                </div>
+              </div>
+            `}
+
+            <table class="batch-items-table">
+              <thead><tr>
+                <th>Item #</th>
+                <th>Name</th>
+                ${def.requireSourcePlacement ? `<th style="text-align:right;">Available</th>` : ''}
+                <th style="text-align:right;">Qty to ${def.verb.toLowerCase()}</th>
+              </tr></thead>
+              <tbody>
+                ${items.map(item => {
+                  const avail = sourceLocked ? batchAvailableAt(item.id, sourceSiteId, sourceLocId) : null;
+                  const skipped = sourceLocked && (avail === 0 || avail === null);
+                  const rawQty = form.qtyByItem[item.id] != null ? form.qtyByItem[item.id] : '';
+                  return `
+                    <tr class="${skipped ? 'batch-row-skipped' : ''}">
+                      <td><span class="id-tag">${escapeHtml(item.itemNumber)}</span></td>
+                      <td>${item.name ? escapeHtml(item.name) : '<span class="muted">—</span>'}</td>
+                      ${def.requireSourcePlacement ? `<td style="text-align:right;" class="mono">${sourceLocked ? (avail === 0 ? `<span class="batch-row-warning">0 · skip</span>` : avail.toLocaleString()) : '<span class="muted">—</span>'}</td>` : ''}
+                      <td style="text-align:right;">
+                        <input type="number" class="qty-input mono-input" min="0" step="1" value="${escapeHtml(rawQty)}" ${skipped ? 'disabled' : ''} placeholder="0" oninput="state.batchActionForm.qtyByItem['${item.id}']=this.value;" />
+                      </td>
+                    </tr>`;
+                }).join('')}
+              </tbody>
+            </table>
+
+            <div class="field full" style="margin-top:14px;">
+              <div class="field-label-row"><label>Notes</label><span class="opt-badge">OPTIONAL</span></div>
+              <input type="text" name="notes" value="${escapeHtml(form.notes || '')}" placeholder="e.g. PO #4521, restock, damaged units" oninput="state.batchActionForm.notes=this.value;" />
+            </div>
+
+            <div class="field-error" id="batchActionError" style="margin-top:10px; min-height:18px;"></div>
+          </form>
+        </div>
+        <div class="modal-foot">
+          <div class="modal-foot-info">// ${items.length} item${items.length === 1 ? '' : 's'} selected · uses single-item commit semantics</div>
+          <div class="modal-foot-buttons">
+            <button class="btn ghost" onclick="closeBatchAction()">CANCEL</button>
+            <button class="btn" onclick="document.getElementById('batchActionForm').requestSubmit()">${def.verb} ALL →</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+/* v54 (Item 1): id → name lookup helpers for the batch modal's text-input
+   pre-fill. State still stores siteId / locationId; we look up the name
+   to display when the modal re-renders. Returns empty string for null
+   / unknown ids so the input value attribute is safe. */
+function siteNameById(id) {
+  if (!id) return '';
+  const s = state.data.sites.find(x => x.id === id);
+  return s ? s.name : '';
+}
+function locationNameById(id) {
+  if (!id) return '';
+  const l = state.data.locations.find(x => x.id === id);
+  return l ? l.name : '';
+}
+
+/* v54 (Item 1): site change handler for the batch modal. The select used
+   to pass the siteId directly; now we get typed text and have to resolve.
+   Unresolved text → empty siteId in state, which leaves the location
+   field disabled. Changing the site also clears the dependent location
+   (no point keeping a stale id from a different site). */
+function onBatchSiteChange(prefix, siteText) {
+  const site = resolveSiteByText(siteText);
+  const siteId = site ? site.id : '';
+  if (prefix === 'from') {
+    state.batchActionForm.fromSiteId = siteId;
+    state.batchActionForm.fromLocationId = '';
+  } else if (prefix === 'to') {
+    state.batchActionForm.toSiteId = siteId;
+    state.batchActionForm.toLocationId = '';
+  } else {
+    state.batchActionForm.siteId = siteId;
+    state.batchActionForm.locationId = '';
+  }
+  renderBatchActionModal();
+}
+
+/* v54 (Item 1): location change handler for the batch modal. Scopes
+   the lookup to the corresponding site so two locations with the same
+   name at different sites don't collide. Re-renders so the per-row
+   availability column refreshes when source location changes. */
+function onBatchLocationChange(prefix, locText) {
+  const siteIdKey = prefix ? prefix + 'SiteId' : 'siteId';
+  const locIdKey  = prefix ? prefix + 'LocationId' : 'locationId';
+  const siteId = state.batchActionForm[siteIdKey];
+  const loc = resolveLocationByText(locText, siteId);
+  state.batchActionForm[locIdKey] = loc ? loc.id : '';
+  renderBatchActionModal();
+}
+
+/* Submit handler: validates per-row, then commits sequentially. Each row
+   uses the same commitAdd / commitRemove / commitMove helper that the
+   single-item Actions tab uses — so the action log, audit log, and
+   placement mutation semantics are identical. Rows with qty === 0 or
+   blank are silently skipped. Rows where the source has zero stock
+   (Remove / Move) are skipped with a note in the summary toast. */
+async function submitBatchAction(e) {
+  e.preventDefault();
+  const kind = state.activeBatchAction;
+  const def = BATCH_DEFS[kind];
+  const form = state.batchActionForm;
+  const items = selectedItemsCurrent();
+  const errEl = document.getElementById('batchActionError');
+  const setError = msg => { if (errEl) errEl.textContent = msg; };
+
+  const isMove = kind === 'move';
+  const srcSite = isMove ? form.fromSiteId : form.siteId;
+  const srcLoc  = isMove ? form.fromLocationId : form.locationId;
+  const dstSite = isMove ? form.toSiteId   : null;
+  const dstLoc  = isMove ? form.toLocationId : null;
+
+  if (!srcSite || !srcLoc) { setError(isMove ? 'Pick a FROM site and location' : 'Pick a site and location'); return; }
+  if (isMove && (!dstSite || !dstLoc)) { setError('Pick a TO site and location'); return; }
+  if (isMove && srcSite === dstSite && srcLoc === dstLoc) { setError('Source and destination are the same'); return; }
+
+  // Build the row list: only rows with qty > 0 participate, and rows
+  // that would draw from an empty source are filtered out up-front so
+  // the operator sees the actual count in the success toast.
+  const rows = [];
+  for (const item of items) {
+    const raw = form.qtyByItem[item.id];
+    const qty = raw ? parseInt(raw, 10) : 0;
+    if (!qty || qty <= 0 || isNaN(qty)) continue;
+    if (def.requireSourcePlacement) {
+      const avail = batchAvailableAt(item.id, srcSite, srcLoc);
+      if (avail == null || avail === 0) continue;
+      if (qty > avail) { setError(`${item.itemNumber}: requested ${qty}, only ${avail} available at source`); return; }
+    }
+    rows.push({ item, qty });
+  }
+  if (rows.length === 0) { setError('Enter a quantity > 0 for at least one item'); return; }
+
+  // Commit sequentially — each call is its own save + log, so partial
+  // progress survives if a later row fails. The trade-off is throughput
+  // for large batches; acceptable for typical sizes (< 100 items).
+  let ok = 0, failed = 0;
+  const errors = [];
+  for (const { item, qty } of rows) {
+    try {
+      if (kind === 'add')         await commitAdd(item, srcSite, srcLoc, qty, form.notes);
+      else if (kind === 'remove') await commitRemove(item, srcSite, srcLoc, qty, form.notes);
+      else if (kind === 'move')   await commitMove(item, srcSite, srcLoc, dstSite, dstLoc, qty, form.notes);
+      ok++;
+    } catch (err) {
+      failed++;
+      errors.push(`${item.itemNumber}: ${err.message}`);
+    }
+  }
+
+  closeBatchAction();
+  if (failed === 0) {
+    toast(`${def.verb}: ${ok} item${ok === 1 ? '' : 's'} processed`, 'success');
+  } else {
+    toast(`${def.verb}: ${ok} succeeded · ${failed} failed (${errors[0]}${failed > 1 ? ` and ${failed - 1} more` : ''})`, 'error');
+  }
+  // Clear the selection now that the batch is done — the user is almost
+  // certainly moving on to a new task, and stale selections after a
+  // successful batch are a common source of "I just acted on the wrong
+  // items" mistakes.
+  state.selectedItemIds.clear();
+  render();
+}
+
+/* ============ REPORTS ============ */
+function renderReports(root) {
+  // Reports redesign (v49): a router that shows a list of available
+  // reports on `state.activeReport === null`, and renders a single
+  // report's detail view otherwise. Each detail has its own back button
+  // and a bottom-right Print button. The actual report content (charts,
+  // tables) is unchanged from before — it's just been split into one
+  // function per report and wrapped in a consistent shell.
+  if (!state.activeReport) {
+    renderReportsList(root);
+  } else if (state.activeReport === 'byCategory') {
+    renderReportByCategory(root);
+  } else if (state.activeReport === 'bySite') {
+    renderReportBySite(root);
+  } else if (state.activeReport === 'crossTab') {
+    renderReportCrossTab(root);
+  } else {
+    // Unknown report id — bounce back to the list rather than render blank.
+    state.activeReport = null;
+    renderReportsList(root);
+  }
+}
+
+/* Open / close helpers used by the list cards and the back buttons in
+   each detail. They mutate state.activeReport and re-render. */
+function openReport(id) { state.activeReport = id; render(); }
+function closeReport()  { state.activeReport = null; render(); }
+
+/* Shared computation: every report below pulls from the same lookup
+   tables, so building them once here keeps each renderer thin. Returns
+   the bag of pre-aggregated structures every detail report needs. */
+function reportData() {
+  const items = state.data.items;
+  const placements = state.data.placements;
+
+  const itemCost = {}, itemCatName = {};
+  items.forEach(i => {
+    itemCost[i.id] = Number(i.cost) || 0;
+    const c = state.data.categories.find(x => x.id === i.categoryId);
+    itemCatName[i.id] = c ? (categoryPathName(i.categoryId) || c.name) : '— uncategorized —';
+  });
+  const itemPlCount = {};
+  items.forEach(i => { itemPlCount[i.id] = 0; });
+  placements.forEach(p => { if (itemPlCount[p.itemId] != null) itemPlCount[p.itemId]++; });
+
+  const totalCost = placements.reduce((s,p) => s + (Number(p.quantity)||0) * (itemCost[p.itemId]||0), 0);
+
+  // BY CATEGORY — aggregate placements grouped by item's category
+  const cats = {};
+  items.forEach(i => {
+    const name = itemCatName[i.id];
+    if (!cats[name]) cats[name] = { value: 0, units: 0, items: 0 };
+    cats[name].items += 1;
+  });
+  placements.forEach(p => {
+    const name = itemCatName[p.itemId] || '— unknown —';
+    if (!cats[name]) cats[name] = { value: 0, units: 0, items: 0 };
+    cats[name].value += (Number(p.quantity)||0) * (itemCost[p.itemId]||0);
+    cats[name].units += (Number(p.quantity)||0);
+  });
+  const catList = Object.entries(cats).sort((a,b)=>b[1].value-a[1].value);
+  const catMax  = Math.max(1, ...catList.map(c=>c[1].value));
+
+  // BY SITE
+  const sites = {};
+  placements.forEach(p => {
+    const s = state.data.sites.find(x => x.id === p.siteId);
+    const name = s ? s.name : '— unknown site —';
+    if (!sites[name]) sites[name] = { value: 0, units: 0, placements: 0 };
+    sites[name].value += (Number(p.quantity)||0) * (itemCost[p.itemId]||0);
+    sites[name].units += (Number(p.quantity)||0);
+    sites[name].placements += 1;
+  });
+  const siteList = Object.entries(sites).sort((a,b)=>b[1].value-a[1].value);
+  const siteMax  = Math.max(1, ...siteList.map(s=>s[1].value));
+
+  const unplacedItems = items.filter(i => (itemPlCount[i.id]||0) === 0).length;
+
+  // CROSSTAB grid
+  const allCats = catList.map(c=>c[0]);
+  const allSites = siteList.map(s=>s[0]);
+  const grid = {};
+  allCats.forEach(c => { grid[c] = {}; allSites.forEach(s => grid[c][s] = 0); });
+  placements.forEach(p => {
+    const item = items.find(x => x.id === p.itemId); if (!item) return;
+    const cn = itemCatName[item.id] || '— uncategorized —';
+    const site = state.data.sites.find(x => x.id === p.siteId);
+    const sn = site ? site.name : '— unknown site —';
+    if (!grid[cn]) { grid[cn] = {}; allSites.forEach(s => grid[cn][s] = 0); }
+    grid[cn][sn] = (grid[cn][sn]||0) + (Number(p.quantity)||0) * (itemCost[p.itemId]||0);
+  });
+  const gridMax = Math.max(1, ...allCats.flatMap(c => allSites.map(s => grid[c][s] || 0)));
+
+  return { items, placements, totalCost, catList, catMax, siteList, siteMax, unplacedItems, allCats, allSites, grid, gridMax };
+}
+
+/* Reports landing page: a card per available report. Click to open. */
+function renderReportsList(root) {
+  const d = reportData();
+  // Catalog entries are the source of truth for both this list and the
+  // openReport() lookup. Adding a fourth report would mean adding an
+  // entry here and a render function below — nothing else changes.
+  const reports = [
+    {
+      id: 'byCategory',
+      title: 'Total Cost by Category',
+      blurb: 'Bar chart of inventory cost summed across all placements, grouped by the item category. Includes a TOTAL row.',
+      stat: `${d.catList.length} categor${d.catList.length === 1 ? 'y' : 'ies'}`,
+      enabled: d.items.length > 0
+    },
+    {
+      id: 'bySite',
+      title: 'Total Cost by Site',
+      blurb: 'Bar chart of inventory cost summed across all placements, grouped by site. Includes a TOTAL row.',
+      stat: `${d.siteList.length} site${d.siteList.length === 1 ? '' : 's'} with placements`,
+      enabled: d.placements.length > 0
+    },
+    {
+      id: 'crossTab',
+      title: 'Category × Site Cross-Tab',
+      blurb: 'Heat-mapped grid showing the cost of each category at each site, with row and column totals and a grand total.',
+      stat: `${d.allCats.length} × ${d.allSites.length}`,
+      enabled: d.placements.length > 0
+    }
+  ];
+
+  root.innerHTML = `
+    <div class="page-head">
+      <div>
+        <div class="page-title">REPORTS</div>
+        <div class="page-sub">// ${reports.length} report${reports.length === 1 ? '' : 's'} available · total inventory cost ${fmt$(d.totalCost)} · ${d.placements.length} placement${d.placements.length === 1 ? '' : 's'}${d.unplacedItems > 0 ? ` · ${d.unplacedItems} item${d.unplacedItems === 1 ? '' : 's'} not yet placed` : ''}</div>
+      </div>
+    </div>
+
+    ${d.items.length === 0 ? `
+      <div class="card"><div class="card-body"><div class="empty"><div class="empty-icon">∅</div><div class="empty-text">// NO INVENTORY TO REPORT ON</div></div></div></div>
+    ` : `
+      <div class="target-grid">
+        ${reports.map(r => `
+          <button class="target-card ${r.enabled ? '' : 'is-disabled'}" type="button"
+                  ${r.enabled ? `onclick="openReport('${r.id}')"` : 'disabled aria-disabled="true"'}
+                  title="${r.enabled ? 'Open this report' : 'No data available yet'}">
+            <div class="target-card-head">
+              <div class="target-card-label">${escapeHtml(r.title)}</div>
+              <div class="target-card-count">${escapeHtml(r.stat)}</div>
+            </div>
+            <div class="target-card-blurb">${escapeHtml(r.blurb)}</div>
+            <div class="target-card-cta">${r.enabled ? '↳ Open report →' : '— not enough data —'}</div>
+          </button>
+        `).join('')}
+      </div>
+    `}
+  `;
+}
+
+/* Shared wrapper for every report detail view — gives each one the
+   same back-button header and a fixed-position Print button in the
+   bottom-right. The Print button uses window.print(); the existing
+   .no-print CSS hides app chrome (topbar, sidebar, etc.) during
+   printing, and the floating button has .no-print on itself so it
+   doesn't show up on paper either. */
+function reportShellHead(title, subtitle) {
+  return `
+    <div class="page-head no-print">
+      <div>
+        <div class="page-title">${escapeHtml(title)}</div>
+        <div class="page-sub">// ${escapeHtml(subtitle)}</div>
+      </div>
+      <div>
+        <button class="btn ghost" onclick="closeReport()">← Reports</button>
+      </div>
+    </div>`;
+}
+function reportShellFoot() {
+  return `
+    <button class="report-print-fab no-print" type="button" onclick="window.print()" title="Print this report — opens your browser's print dialog (paper size, scale, and margins are set there).">⌬ PRINT</button>`;
+}
+
+function renderReportByCategory(root) {
+  const d = reportData();
+  root.innerHTML = `
+    ${reportShellHead('Total Cost by Category', `Inventory cost rolled up by item category · ${fmt$(d.totalCost)} total across ${d.placements.length} placement${d.placements.length === 1 ? '' : 's'}`)}
+    <div class="card">
+      <div class="card-head"><div class="card-title">Total Cost by Category</div></div>
+      <div class="card-body">
+        ${d.catList.length === 0 ? `<div class="empty"><div class="empty-icon">∅</div><div class="empty-text">// NO DATA</div></div>` : d.catList.map(([name, dd]) => `
+          <div class="bar-row">
+            <div class="bar-label">${escapeHtml(name)}<div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-faint);margin-top:2px;">${dd.items} SKU · ${dd.units.toLocaleString()} units</div></div>
+            <div class="bar-track"><div class="bar-fill" style="width:${(dd.value/d.catMax*100).toFixed(1)}%"></div></div>
+            <div class="bar-value">${fmt$(dd.value)}</div>
+          </div>`).join('')}
+        <div class="bar-row" style="border-top:1px solid var(--border-strong);border-bottom:none;margin-top:8px;padding-top:12px;">
+          <div class="bar-label" style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;color:var(--amber)">TOTAL</div><div></div>
+          <div class="bar-value" style="color:var(--amber);font-size:14px;">${fmt$(d.totalCost)}</div>
+        </div>
+      </div>
+    </div>
+    ${reportShellFoot()}`;
+}
+
+function renderReportBySite(root) {
+  const d = reportData();
+  root.innerHTML = `
+    ${reportShellHead('Total Cost by Site', `Inventory cost rolled up by site · ${fmt$(d.totalCost)} total across ${d.placements.length} placement${d.placements.length === 1 ? '' : 's'}`)}
+    <div class="card">
+      <div class="card-head"><div class="card-title">Total Cost by Site</div></div>
+      <div class="card-body">
+        ${d.siteList.length === 0 ? `<div class="empty" style="padding:24px;"><div class="empty-text">// NO PLACEMENTS YET</div></div>` : d.siteList.map(([name, dd]) => `
+          <div class="bar-row">
+            <div class="bar-label">${escapeHtml(name)}<div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-faint);margin-top:2px;">${dd.placements} placement${dd.placements === 1 ? '' : 's'} · ${dd.units.toLocaleString()} units</div></div>
+            <div class="bar-track"><div class="bar-fill" style="width:${(dd.value/d.siteMax*100).toFixed(1)}%;background:var(--orange);"></div></div>
+            <div class="bar-value">${fmt$(dd.value)}</div>
+          </div>`).join('')}
+        <div class="bar-row" style="border-top:1px solid var(--border-strong);border-bottom:none;margin-top:8px;padding-top:12px;">
+          <div class="bar-label" style="font-family:'Bebas Neue',sans-serif;font-size:18px;letter-spacing:2px;color:var(--orange)">TOTAL</div><div></div>
+          <div class="bar-value" style="color:var(--orange);font-size:14px;">${fmt$(d.totalCost)}</div>
+        </div>
+      </div>
+    </div>
+    ${reportShellFoot()}`;
+}
+
+function renderReportCrossTab(root) {
+  const d = reportData();
+  root.innerHTML = `
+    ${reportShellHead('Category × Site Cross-Tab', `Cost at each (category, site) cell · ${fmt$(d.totalCost)} grand total`)}
+    <div class="card">
+      <div class="card-head"><div class="card-title">Cross-Tab · Category × Site</div></div>
+      <div class="card-body">
+        ${d.allCats.length === 0 || d.allSites.length === 0 ? `<div class="empty"><div class="empty-icon">∅</div><div class="empty-text">// NOT ENOUGH DATA YET — need at least one category and one placement</div></div>` : `
+        <div class="table-wrap">
+          <table class="crosstab">
+            <thead><tr><th></th>${d.allSites.map(s => `<th>${escapeHtml(s)}</th>`).join('')}<th class="tot">TOTAL</th></tr></thead>
+            <tbody>
+              ${d.allCats.map(c => {
+                const rowTotal = d.allSites.reduce((sum,s)=>sum+(d.grid[c][s]||0), 0);
+                return `<tr>
+                  <td><strong>${escapeHtml(c)}</strong></td>
+                  ${d.allSites.map(s => { const v = d.grid[c][s]||0; const pct = (v/d.gridMax*100).toFixed(0); return `<td class="cell">${v>0?`<div class="cell-bar" style="width:${pct}%"></div>`:''}<span>${v>0?fmt$(v):'—'}</span></td>`; }).join('')}
+                  <td class="cell tot"><span><strong>${fmt$(rowTotal)}</strong></span></td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+            <tfoot>
+              <tr><td>TOTAL</td>
+                ${d.allSites.map(s => { const colTotal = d.allCats.reduce((sum,c)=>sum+(d.grid[c][s]||0), 0); return `<td class="cell"><span>${fmt$(colTotal)}</span></td>`; }).join('')}
+                <td class="cell" style="color:var(--amber);"><span><strong>${fmt$(d.totalCost)}</strong></span></td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>`}
+      </div>
+    </div>
+    ${reportShellFoot()}`;
+}
+
+function exportReportCSV() {
+  const items = state.data.items;
+  const placements = state.data.placements;
+  const itemCost = {}, itemCatName = {}, itemPlCount = {};
+  items.forEach(i => {
+    itemCost[i.id] = Number(i.cost) || 0;
+    const c = state.data.categories.find(x => x.id === i.categoryId);
+    itemCatName[i.id] = c ? (categoryPathName(i.categoryId) || c.name) : '— uncategorized —';
+    itemPlCount[i.id] = 0;
+  });
+  placements.forEach(p => { if (itemPlCount[p.itemId] != null) itemPlCount[p.itemId]++; });
+
+  const lines = ['Report,Pay & Save Inventory Cost Report,Generated,' + new Date().toLocaleString() + ',Operator,' + state.user.email];
+  lines.push('');
+  lines.push('BY CATEGORY (placement-level)'); lines.push('Category,SKUs,Units,Total Cost');
+  const cats = {};
+  items.forEach(i => {
+    const name = itemCatName[i.id];
+    if (!cats[name]) cats[name] = { value: 0, units: 0, items: 0 };
+    cats[name].items += 1;
+  });
+  placements.forEach(p => {
+    const name = itemCatName[p.itemId] || '— unknown —';
+    if (!cats[name]) cats[name] = { value: 0, units: 0, items: 0 };
+    cats[name].value += (Number(p.quantity)||0) * (itemCost[p.itemId]||0);
+    cats[name].units += (Number(p.quantity)||0);
+  });
+  Object.entries(cats).sort((a,b)=>b[1].value-a[1].value).forEach(([n,d]) => lines.push(`"${n.replace(/"/g,'""')}",${d.items},${d.units},${d.value.toFixed(2)}`));
+
+  lines.push(''); lines.push('BY SITE (placement-level)'); lines.push('Site,Placements,Units,Total Cost');
+  const sites = {};
+  placements.forEach(p => {
+    const s = state.data.sites.find(x => x.id === p.siteId);
+    const name = s ? s.name : '— unknown site —';
+    if (!sites[name]) sites[name] = { value: 0, units: 0, placements: 0 };
+    sites[name].value += (Number(p.quantity)||0) * (itemCost[p.itemId]||0);
+    sites[name].units += (Number(p.quantity)||0);
+    sites[name].placements += 1;
+  });
+  Object.entries(sites).sort((a,b)=>b[1].value-a[1].value).forEach(([n,d]) => lines.push(`"${n.replace(/"/g,'""')}",${d.placements},${d.units},${d.value.toFixed(2)}`));
+
+  // Items with no placements (informational)
+  const unplaced = items.filter(i => (itemPlCount[i.id]||0) === 0);
+  if (unplaced.length > 0) {
+    lines.push('');
+    lines.push(`NOT YET PLACED (${unplaced.length} item${unplaced.length===1?'':'s'})`);
+    lines.push('itemNumber,name');
+    unplaced.forEach(i => lines.push(`"${(i.itemNumber||'').replace(/"/g,'""')}","${(i.name||'').replace(/"/g,'""')}"`));
+  }
+
+  downloadCSV(lines.join('\n'), 'pay-and-save-inventory-report.csv');
+  logAction('REPORT_EXPORT', 'items', null, 'Exported inventory cost report');
+}
+
+function exportItemsCSV() {
+  const lines = ['itemNumber,name,category,cost,listPrice,salesPrice,minStock,placementCount,totalQty,totalCost,lowStock,description,notes,createdBy,createdAt,lastModifiedBy,lastModifiedAt'];
+  state.data.items.forEach(i => {
+    const c = state.data.categories.find(x => x.id === i.categoryId);
+    const pls = state.data.placements.filter(p => p.itemId === i.id);
+    const totalQty = pls.reduce((s,p)=>s+(Number(p.quantity)||0),0);
+    const totalCost = (Number(i.cost)||0) * totalQty;
+    const low = isLowStock(i);
+    // NOTE: we emit just c.name (the leaf), NOT the "Parent / Sub" path.
+    // Category names are globally unique, so the import-side lookup-by-name
+    // resolves correctly — emitting the path would break round-trip.
+    lines.push([
+      `"${(i.itemNumber||'').replace(/"/g,'""')}"`,
+      `"${(i.name||'').replace(/"/g,'""')}"`,
+      `"${(c ? c.name : '').replace(/"/g,'""')}"`,
+      i.cost == null ? '' : Number(i.cost).toFixed(2),
+      i.listPrice == null ? '' : Number(i.listPrice).toFixed(2),
+      i.salesPrice == null ? '' : Number(i.salesPrice).toFixed(2),
+      i.minStock == null || i.minStock === '' ? '' : Number(i.minStock),
+      pls.length,
+      totalQty,
+      i.cost == null ? '' : totalCost.toFixed(2),
+      low ? 'YES' : '',
+      `"${(i.description||'').replace(/"/g,'""')}"`,
+      `"${(i.notes||'').replace(/"/g,'""')}"`,
+      i.createdBy || '', new Date(i.createdAt).toISOString(),
+      i.lastModifiedBy || '', new Date(i.lastModifiedAt).toISOString()
+    ].join(','));
+  });
+  downloadCSV(lines.join('\n'), 'pay-and-save-items.csv');
+  logAction('EXPORT', 'items', null, `Exported ${state.data.items.length} items`);
+}
+
+/* Placements export — mirrors the import column order so the same file
+   could in principle be re-imported (with the addition of audit metadata
+   columns at the end). Uses item / site / location names rather than
+   internal IDs so the file is portable across instances. */
+function exportPlacementsCSV() {
+  const lines = ['itemNumber,itemName,site,location,quantity,lineCost,createdBy,createdAt,lastModifiedBy,lastModifiedAt'];
+  state.data.placements.forEach(p => {
+    const item = state.data.items.find(x => x.id === p.itemId);
+    const site = state.data.sites.find(x => x.id === p.siteId);
+    const loc  = state.data.locations.find(x => x.id === p.locationId);
+    const qty  = Number(p.quantity) || 0;
+    const cost = item && item.cost != null ? Number(item.cost) * qty : null;
+    lines.push([
+      `"${(item ? item.itemNumber : '').replace(/"/g,'""')}"`,
+      `"${(item && item.name ? item.name : '').replace(/"/g,'""')}"`,
+      `"${(site ? site.name : '').replace(/"/g,'""')}"`,
+      `"${(loc ? loc.name : '').replace(/"/g,'""')}"`,
+      qty,
+      cost == null ? '' : cost.toFixed(2),
+      p.createdBy || '', p.createdAt ? new Date(p.createdAt).toISOString() : '',
+      p.lastModifiedBy || '', p.lastModifiedAt ? new Date(p.lastModifiedAt).toISOString() : ''
+    ].join(','));
+  });
+  downloadCSV(lines.join('\n'), 'pay-and-save-placements.csv');
+  logAction('EXPORT', 'placements', null, `Exported ${state.data.placements.length} placements`);
+}
+
+/* ============ AUDIT LOG ============ */
+function renderAudit(root) {
+  const users = [...new Set(state.audit.map(a => a.userId))].sort();
+  const actions = [...new Set(state.audit.map(a => a.action))].sort();
+  const f = state.auditFilters;
+  let rows = [...state.audit].reverse();
+  if (f.user)   rows = rows.filter(r => r.userId === f.user);
+  if (f.action) rows = rows.filter(r => r.action === f.action);
+
+  root.innerHTML = `
+    <div class="page-head">
+      <div><div class="page-title">AUDIT LOG</div><div class="page-sub">// ${rows.length} of ${state.audit.length} events · most recent first</div></div>
+    </div>
+    <div class="card">
+      <div class="card-body">
+        <div class="filter-bar">
+          <select onchange="state.auditFilters.user=this.value; render();">
+            <option value="">All Operators</option>
+            ${users.map(u => `<option value="${escapeHtml(u)}" ${f.user===u?'selected':''}>${escapeHtml(u)}</option>`).join('')}
+          </select>
+          <select onchange="state.auditFilters.action=this.value; render();">
+            <option value="">All Actions</option>
+            ${actions.map(a => `<option value="${escapeHtml(a)}" ${f.action===a?'selected':''}>${escapeHtml(a)}</option>`).join('')}
+          </select>
+          ${(f.user||f.action) ? `<button class="btn ghost sm" onclick="state.auditFilters={user:'',action:''}; render();">CLEAR</button>` : ''}
+        </div>
+        ${rows.length === 0 ? `<div class="empty"><div class="empty-icon">∅</div><div class="empty-text">// NO EVENTS LOGGED</div></div>` : `
+          <div style="border-top:1px solid var(--border);">
+            ${rows.map(r => `
+              <div class="audit-row">
+                <div class="audit-time">${fmtDate(r.timestamp)}</div>
+                <div>
+                  <div class="audit-user">${escapeHtml(r.userName||r.userId)}</div>
+                  <div class="audit-user-sub">${escapeHtml(r.userTitle||'')} · ${escapeHtml(r.userId)}</div>
+                </div>
+                <div><span class="badge ${actionBadgeClass(r.action)}">${escapeHtml(r.action)}</span></div>
+                <div class="audit-detail">${r.entityLabel ? '<strong>' + escapeHtml(r.entityLabel) + '</strong> · ' : ''}${escapeHtml(r.details)}</div>
+              </div>`).join('')}
+          </div>`}
+      </div>
+    </div>`;
+}
+
+/* ---------- KEYBOARD ---------- */
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.getElementById('modalHost').innerHTML) closeForm();
+});
+
+/* ---------- INIT ---------- */
+loadAll().then(async () => {
+  // Working-site selection is per-device localStorage. Load it early so
+  // the topbar button label and any initial Dashboard/Categories render
+  // pick up the saved scope on first paint.
+  loadWorkingSitesFromStorage();
+
+  // v64: register listeners that keep the realtime subscription healthy
+  // across tab backgrounding and network drops. The Supabase WebSocket
+  // is the only path for cross-device updates; if it dies silently the
+  // page goes stale. These listeners trigger reconnect + a fresh data
+  // pull when the tab regains focus or the OS reports we're back online.
+  // Registered exactly once at boot; idempotent listeners.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') onAppFocused();
+  });
+  window.addEventListener('focus',  () => onAppFocused());     // belt-and-suspenders on browsers that don't fire visibilitychange reliably
+  window.addEventListener('online', () => onNetworkOnline());
+
+  // v69: global focusin/focusout that attach the barcode scan floater
+  // to ANY text-like input (not just search inputs). The floater only
+  // shows on mobile / simple view modes — desktop with a physical
+  // keyboard doesn't get an above-keyboard affordance.
+  document.addEventListener('focusin',  handleGlobalScanFocusIn);
+  document.addEventListener('focusout', handleGlobalScanFocusOut);
+
+  // v59 (Request 2): one-time migration of any pre-v59 cloud viewMode
+  // value into per-device localStorage. No-op if local was already set
+  // (i.e. this device has toggled at least once since v59 shipped).
+  // Awaited so an initial paint that depends on viewMode (Logo settings
+  // page, etc.) doesn't briefly flash the wrong layout.
+  await migrateViewModeFromCloud();
+  // v65 (Request 1): re-evaluate the Low Stock default after migration,
+  // since migrateViewModeFromCloud may have flipped state.viewMode from
+  // 'web' to 'mobile'. Idempotent — if viewMode didn't change, this is
+  // a no-op repeat of the loadAll() init.
+  if (state.viewMode === 'mobile') state.lowStockCollapsed = true;
+
+  // New-device handling. If local has no users but cloud is configured
+  // (either via per-device localStorage settings, or via the file-level
+  // CLOUD_DEFAULT_URL / CLOUD_DEFAULT_KEY constants), try to pull the
+  // existing workspace from cloud BEFORE showing the sign-in screen.
+  //
+  // Without this, a fresh browser on a new device would see the
+  // bootstrap "create first user" form even though the team already
+  // has users in cloud — because loadAll() only reads from the local
+  // wrapper, which is empty on a fresh device.
+  //
+  // The "users.length === 0" guard makes this conservative: we only
+  // pull when local has literally nothing to lose. Established devices
+  // get realtime updates via the cloud subscription, not via this path.
+  if (state.data.users.length === 0 && CLOUD.url && CLOUD.anonKey && CLOUD.enabled) {
+    try {
+      console.info('[pay-and-save] new device · auto-pulling cloud workspace…');
+      await connectCloud();
+      await pullCloudToLocal();
+      await loadAll();
+      console.info(`[pay-and-save] auto-pull complete · ${state.data.users.length} users · ${state.data.items.length} items`);
+    } catch (e) {
+      // Cloud unreachable or misconfigured — fall through to local
+      // bootstrap so the user isn't stuck on a blank screen. The
+      // bootstrap path still lets them create a first user offline.
+      console.warn('[pay-and-save] auto-pull on startup failed:', e);
+    }
+  }
+  // Session restore. If a prior sign-in stamped SESSION_KEY into
+  // localStorage, find the matching user record and skip straight to
+  // enterApp() — that's what makes a page refresh keep you signed in
+  // instead of bouncing you back to the sign-in screen.
+  //
+  // We re-resolve the user from state.data.users (rather than trusting
+  // a stored snapshot) so cross-device edits to the user's name, title,
+  // or email take effect on refresh. Any of these failure modes clears
+  // the stale session and falls through to renderSignIn:
+  //   - localStorage entry missing or malformed JSON
+  //   - referenced user id no longer exists (deleted on another device)
+  //   - user record has no passwordHash (legacy / never set up here —
+  //     they need to go through the set-password flow, not bypass it)
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (raw) {
+      const sess = JSON.parse(raw);
+      const u = sess && sess.userId
+        ? state.data.users.find(x => x.id === sess.userId)
+        : null;
+      if (u && u.passwordHash) {
+        state.user = { id: u.id, email: u.email, firstName: u.firstName, lastName: u.lastName, title: u.title, profileImage: u.profileImage || null };
+        logAction('SIGN_IN', null, null, 'Session restored from prior sign-in');
+        enterApp();
+        return;
+      }
+      // Stale or invalid — clear it so we don't loop on it next refresh.
+      localStorage.removeItem(SESSION_KEY);
+    }
+  } catch (e) {
+    try { localStorage.removeItem(SESSION_KEY); } catch (_) {}
+    console.warn('[pay-and-save] session restore failed:', e);
+  }
+  renderSignIn();
+});
